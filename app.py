@@ -146,6 +146,7 @@ def format_summary(user_id: int):
 # ---- Telegram handlers ------------------------------------------------------
 
 async def cmd_start(update: Update, context: CallbackContext):
+    print(">>> /start received from", update.effective_user.id)  # лог
     user_id = update.effective_user.id
     start_payload(user_id)
     await update.message.reply_text(
@@ -285,6 +286,7 @@ def _ensure_ptb_running():
     global _bot_started
     if not _bot_started:
         _bot_started = True
+        print(">>> Starting PTB background loop...")
         threading.Thread(target=_run_ptb_loop, daemon=True).start()
 
 # ───────────────────────────────────────────────────────────────────────────────
