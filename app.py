@@ -21,7 +21,7 @@ ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 BASE_URL = os.getenv("BASE_URL", "")  # для /set-webhook
 
 # ───────────────────────────────────────────────────────────────────────────────
-# ЧЕК-ЛИСТ
+# ЧЕК-ЛИСТ (редактируй под себя)
 CHECKLIST_BLOCKS = [
     {"code": "assortment","title":"1) Общее размещение ассортимента","items":[
         "Категории выстроены по зонированию",
@@ -110,6 +110,7 @@ def format_summary(uid: int):
 
 # ── handlers ───────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: CallbackContext):
+    print(">>> /start received from", update.effective_user.id)
     user_id = update.effective_user.id
     start_payload(user_id)
     await update.message.reply_text(
@@ -163,10 +164,12 @@ async def handle_callback(update: Update, context: CallbackContext):
         if st["current_block"] >= len(CHECKLIST_BLOCKS):
             summary, _ = format_summary(uid)
             await q.edit_message_text(summary, parse_mode="Markdown")
+
             if st["photos"]:
                 media = [InputMediaPhoto(pid) for pid in st["photos"][:10]]
                 try: await context.bot.send_media_group(chat_id=uid, media=media)
                 except Exception: pass
+
             if ADMIN_ID:
                 try:
                     await context.bot.send_message(chat_id=ADMIN_ID, text=summary, parse_mode="Markdown")
@@ -174,6 +177,7 @@ async def handle_callback(update: Update, context: CallbackContext):
                         media = [InputMediaPhoto(pid) for pid in st["photos"][:10]]
                         await context.bot.send_media_group(chat_id=ADMIN_ID, media=media)
                 except Exception: pass
+
             start_payload(uid); return
 
         block, item = get_block_and_item(uid)
@@ -229,9 +233,23 @@ threading.Thread(target=_run_ptb_background, daemon=True).start()
 # Flask routes
 @app.post("/")
 def webhook():
-    """Получаем апдейты от Telegram и ПРОСИМ PTB их обработать."""
+    """Получаем апдейты от Telegram: шлём быстрый ответ и передаём в PTB."""
     update = Update.de_json(request.get_json(force=True), application.bot)
-    # важно: процессим напрямую, а не через update_queue
+
+    # ВРЕМЕННАЯ диагностика — мгновенный ответ пользователю, чтобы понять «жив ли канал»
+    try:
+        if update.message and update.message.chat and update.message.text:
+            asyncio.run_coroutine_threadsafe(
+                application.bot.send_message(
+                    chat_id=update.message.chat.id,
+                    text="✅ Webhook OK (я тебя слышу). Сейчас подключаю сценарий…"
+                ),
+                _loop
+            )
+    except Exception as e:
+        print(">>> direct reply error:", e)
+
+    # Основной путь: отдаём апдейт в PTB
     asyncio.run_coroutine_threadsafe(application.process_update(update), _loop)
     return "ok", 200
 
@@ -242,6 +260,13 @@ def set_webhook():
                                           allowed_updates=["message","callback_query"])
     asyncio.get_event_loop().run_until_complete(_set())
     return f"Webhook set to {BASE_URL}/", 200
+
+@app.get("/whoami")
+def whoami():
+    async def _get():
+        me = await application.bot.get_me()
+        return f"Bot: @{me.username} (id: {me.id})"
+    return asyncio.get_event_loop().run_until_complete(_get()), 200
 
 @app.get("/health")
 def health():
