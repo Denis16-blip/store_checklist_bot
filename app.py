@@ -21,7 +21,7 @@ ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 BASE_URL = os.getenv("BASE_URL", "")  # для /set-webhook
 
 # ───────────────────────────────────────────────────────────────────────────────
-# ЧЕК-ЛИСТ (можно редактировать под себя)
+# ЧЕК-ЛИСТ (редактируй под себя)
 CHECKLIST_BLOCKS = [
     {
         "code": "assortment",
@@ -80,7 +80,7 @@ CHECKLIST_BLOCKS = [
 ]
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Состояния (RAM; на проде лучше БД/Redis)
+# Состояния (RAM; на прод лучше БД/Redis)
 USER_STATE = {}
 
 # Flask + PTB Application
@@ -267,19 +267,25 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_com
 application.add_handler(MessageHandler(filters.PHOTO, save_photo))
 
 # ───────────────────────────────────────────────────────────────────────────────
-# ЗАПУСК PTB В ФОНЕ (совместимо с Flask 3.x)
+# ЗАПУСК PTB В ФОНЕ (устойчиво для Flask 3.x + Gunicorn)
 _bot_started = False
+_loop: asyncio.AbstractEventLoop | None = None
 
-async def _ptb_start():
-    await application.initialize()
-    await application.start()
+def _run_ptb_loop():
+    """Отдельный event loop, который живёт всё время работы процесса."""
+    global _loop
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+    _loop.run_until_complete(application.initialize())
+    _loop.create_task(application.start())
+    _loop.run_forever()
 
-@app.before_request  # сработает один раз благодаря флагу
+@app.before_request
 def _ensure_ptb_running():
     global _bot_started
     if not _bot_started:
         _bot_started = True
-        threading.Thread(target=lambda: asyncio.run(_ptb_start()), daemon=True).start()
+        threading.Thread(target=_run_ptb_loop, daemon=True).start()
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Flask-маршруты
@@ -295,6 +301,7 @@ def set_webhook():
     """Однократно выставить вебхук на BASE_URL/"""
     async def _set():
         await application.bot.set_webhook(f"{BASE_URL}/", allowed_updates=["message", "callback_query"])
+    # вызываем в том же процессе, отдельный loop тут не нужен
     asyncio.get_event_loop().run_until_complete(_set())
     return f"Webhook set to {BASE_URL}/", 200
 
@@ -305,4 +312,3 @@ def health():
 if __name__ == "__main__":
     # локальный smoke-тест (на Render запускается через gunicorn)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
