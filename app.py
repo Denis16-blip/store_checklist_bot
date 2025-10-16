@@ -21,7 +21,7 @@ ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 BASE_URL = os.getenv("BASE_URL", "")  # для /set-webhook
 
 # ───────────────────────────────────────────────────────────────────────────────
-# ЧЕК-ЛИСТ (можно редактировать)
+# ЧЕК-ЛИСТ (можно редактировать под себя)
 CHECKLIST_BLOCKS = [
     {
         "code": "assortment",
@@ -267,17 +267,15 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_com
 application.add_handler(MessageHandler(filters.PHOTO, save_photo))
 
 # ───────────────────────────────────────────────────────────────────────────────
-# ЗАПУСК PTB В ФОНЕ (важно для вебхуков под Flask/Gunicorn)
+# ЗАПУСК PTB В ФОНЕ (совместимо с Flask 3.x)
 _bot_started = False
 
 async def _ptb_start():
     await application.initialize()
     await application.start()
-    # application.process_update(...) обрабатывает события из очереди,
-    # которую мы заполняем в /webhook
 
-@app.before_first_request
-def _launch_ptb():
+@app.before_request  # сработает один раз благодаря флагу
+def _ensure_ptb_running():
     global _bot_started
     if not _bot_started:
         _bot_started = True
@@ -307,3 +305,4 @@ def health():
 if __name__ == "__main__":
     # локальный smoke-тест (на Render запускается через gunicorn)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
