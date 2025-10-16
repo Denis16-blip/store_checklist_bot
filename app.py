@@ -236,7 +236,7 @@ def webhook():
     """Получаем апдейты от Telegram: шлём быстрый ответ и передаём в PTB."""
     update = Update.de_json(request.get_json(force=True), application.bot)
 
-    # ВРЕМЕННАЯ диагностика — мгновенный ответ пользователю, чтобы понять «жив ли канал»
+    # Быстрый сигнал пользователю, что webhook жив (диагностика)
     try:
         if update.message and update.message.chat and update.message.text:
             asyncio.run_coroutine_threadsafe(
@@ -258,15 +258,19 @@ def set_webhook():
     async def _set():
         await application.bot.set_webhook(f"{BASE_URL}/",
                                           allowed_updates=["message","callback_query"])
-    asyncio.get_event_loop().run_until_complete(_set())
+    fut = asyncio.run_coroutine_threadsafe(_set(), _loop)
+    fut.result(timeout=15)
     return f"Webhook set to {BASE_URL}/", 200
 
 @app.get("/whoami")
 def whoami():
+    if _loop is None:
+        return "Loop not ready", 503
     async def _get():
         me = await application.bot.get_me()
         return f"Bot: @{me.username} (id: {me.id})"
-    return asyncio.get_event_loop().run_until_complete(_get()), 200
+    fut = asyncio.run_coroutine_threadsafe(_get(), _loop)
+    return fut.result(timeout=15), 200
 
 @app.get("/health")
 def health():
@@ -274,3 +278,4 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
