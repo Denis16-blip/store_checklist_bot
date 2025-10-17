@@ -1,8 +1,8 @@
-
+# app.py
 import os
 import asyncio
 import traceback
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -53,8 +53,12 @@ app = Flask(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 ptb_loop: asyncio.AbstractEventLoop | None = None
 application: Application | None = None
-ptb_ready = Event()             # PTB полностью поднят
-last_ptb_error: Optional[str] = None  # текст последней ошибки старта
+ptb_ready = Event()                  # PTB полностью поднят
+last_ptb_error: Optional[str] = None # текст последней ошибки старта
+
+# для одноразового запуска при первом HTTP-запросе (Flask 3)
+_start_kicked = False
+_start_lock = Lock()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ЧЕК-ЛИСТ (СТРОГО ПО PPTX, разбивка на тезисы)
@@ -300,8 +304,10 @@ async def go_next_or_finish(q, context: ContextTypes.DEFAULT_TYPE):
     user = context.user_data
     user["idx"] = int(user.get("idx", 0)) + 1
     if user["idx"] >= len(ALL_ITEMS):
-        await q.message.reply_text("Пункты закончились. Нажми «🏁 Завершить».",
-                                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏁 Завершить", callback_data="finish")]]))
+        await q.message.reply_text(
+            "Пункты закончились. Нажми «🏁 Завершить».",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏁 Завершить", callback_data="finish")]])
+        )
         return
     next_item = ALL_ITEMS[user["idx"]]
     await q.message.reply_text(render_item_text(next_item), reply_markup=kb_main())
@@ -439,8 +445,6 @@ def _ptb_thread():
         try:
             ptb_ready.clear()
             if application:
-                if ptb_loop and ptb_loop.is_running():
-                    pass
                 if ptb_loop:
                     ptb_loop.run_until_complete(application.stop())
                     ptb_loop.run_until_complete(application.shutdown())
@@ -463,24 +467,24 @@ def ensure_ptb_thread():
 ensure_ptb_thread()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ГАРАНТИРОВАННЫЙ ПУСК И РУЧНОЙ РЕСТАРТ PTB-ТРЕДА
+# ГАРАНТИРОВАННЫЙ ПУСК НА ПЕРВОМ HTTP-ЗАПРОСЕ + РУЧНОЙ РЕСТАРТ
 # ──────────────────────────────────────────────────────────────────────────────
-@app.before_first_request
-def _kick_ptb_on_first_request():
-    try:
-        print(">>> before_first_request: ensure_ptb_thread()")
-        ensure_ptb_thread()
-    except Exception as e:
-        print(">>> before_first_request error:", e)
+@app.before_request
+def _kick_ptb_once_on_first_request():
+    global _start_kicked
+    if not _start_kicked:
+        with _start_lock:
+            if not _start_kicked:
+                print(">>> before_request(one-time): ensure_ptb_thread()")
+                ensure_ptb_thread()
+                _start_kicked = True
 
 @app.get("/_restart_ptb")
 def restart_ptb():
-    # если не поднят — поднимем
     if not ptb_ready.is_set():
         print(">>> manual restart: ensure_ptb_thread()")
         ensure_ptb_thread()
         return jsonify({"ok": True, "action": "started"}), 200
-    # уже бежит
     return jsonify({"ok": True, "action": "already_running"}), 200
 
 # ──────────────────────────────────────────────────────────────────────────────
