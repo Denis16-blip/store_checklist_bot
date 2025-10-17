@@ -1,6 +1,7 @@
 import os
 import asyncio
 import threading
+from typing import Optional
 
 from flask import Flask, request
 from dotenv import load_dotenv
@@ -21,7 +22,7 @@ ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 BASE_URL = os.getenv("BASE_URL", "")  # для /set-webhook
 
 # ───────────────────────────────────────────────────────────────────────────────
-# ЧЕК-ЛИСТ (редактируй под себя)
+# ЧЕК-ЛИСТ (можно редактировать)
 CHECKLIST_BLOCKS = [
     {"code": "assortment","title":"1) Общее размещение ассортимента","items":[
         "Категории выстроены по зонированию",
@@ -61,6 +62,9 @@ USER_STATE = {}
 
 # Flask + PTB
 app = Flask(__name__)
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty")
+
 application = Application.builder().token(BOT_TOKEN).build()
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -210,33 +214,65 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_com
 application.add_handler(MessageHandler(filters.PHOTO, save_photo))
 
 # ───────────────────────────────────────────────────────────────────────────────
-# PTB в отдельном event loop + держим живым
-_loop: asyncio.AbstractEventLoop | None = None
+# PTB в отдельном event loop + гарантированный старт
+_loop: Optional[asyncio.AbstractEventLoop] = None
+_ready = threading.Event()
 
 def _run_ptb_background():
     global _loop
-    _loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_loop)
+    try:
+        print(">>> PTB thread: creating loop")
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
 
-    async def _boot():
-        await application.initialize()
-        await application.start()
-        print(">>> PTB started")
+        async def _boot():
+            print(">>> PTB thread: initialize()…")
+            await application.initialize()
+            print(">>> PTB thread: start()…")
+            await application.start()
+            print(">>> PTB started")
 
-    _loop.run_until_complete(_boot())
-    _loop.run_forever()
+        _loop.run_until_complete(_boot())
+        _ready.set()
+        _loop.run_forever()
+    except Exception as e:
+        import traceback
+        print(">>> PTB thread crashed:", e)
+        traceback.print_exc()
+        _ready.set()  # чтобы /_loop что-то показал
 
-# стартуем фоном сразу при импорте модуля (в воркере gunicorn)
-threading.Thread(target=_run_ptb_background, daemon=True).start()
+def _ensure_thread_started():
+    if not _ready.is_set():
+        print(">>> PTB thread: starting…")
+        t = threading.Thread(target=_run_ptb_background, daemon=True)
+        t.start()
+
+# Стартуем фоном сразу при импорте (в воркере gunicorn)
+_ensure_thread_started()
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Flask routes
 @app.post("/")
 def webhook():
-    """Получаем апдейты от Telegram: шлём быстрый ответ и передаём в PTB."""
-    update = Update.de_json(request.get_json(force=True), application.bot)
+    """Вебхук Telegram: логируем, шлём быстрый ответ и отдаём апдейт в PTB."""
+    if not _ready.wait(timeout=3):
+        # луп ещё не готов — отдаём 503, чтобы Telegram повторил апдейт
+        print(">>> webhook: loop not ready, returning 503 to retry")
+        return "loop not ready", 503
 
-    # Быстрый сигнал пользователю, что webhook жив (диагностика)
+    data = request.get_json(silent=True) or {}
+    try:
+        update = Update.de_json(data, application.bot)
+    except Exception as e:
+        print(">>> webhook: bad update json:", e, data)
+        return "bad update", 200
+
+    print(">>> incoming update:",
+          (update.to_dict().get("message") or
+           update.to_dict().get("callback_query") or
+           list(update.to_dict().keys())))
+
+    # Временный "пульс": сразу ответим пользователю, если это текст
     try:
         if update.message and update.message.chat and update.message.text:
             asyncio.run_coroutine_threadsafe(
@@ -250,27 +286,42 @@ def webhook():
         print(">>> direct reply error:", e)
 
     # Основной путь: отдаём апдейт в PTB
-    asyncio.run_coroutine_threadsafe(application.process_update(update), _loop)
+    try:
+        asyncio.run_coroutine_threadsafe(application.process_update(update), _loop)
+    except Exception as e:
+        print(">>> process_update error:", e)
+
     return "ok", 200
 
 @app.get("/set-webhook")
 def set_webhook():
+    if not _ready.wait(timeout=3):
+        return "loop not ready", 503
+
     async def _set():
-        await application.bot.set_webhook(f"{BASE_URL}/",
-                                          allowed_updates=["message","callback_query"])
+        await application.bot.set_webhook(
+            f"{BASE_URL}/",
+            allowed_updates=["message", "callback_query"]
+        )
     fut = asyncio.run_coroutine_threadsafe(_set(), _loop)
     fut.result(timeout=15)
     return f"Webhook set to {BASE_URL}/", 200
 
 @app.get("/whoami")
 def whoami():
-    if _loop is None:
-        return "Loop not ready", 503
+    if not _ready.wait(timeout=3):
+        return "loop not ready", 503
     async def _get():
         me = await application.bot.get_me()
         return f"Bot: @{me.username} (id: {me.id})"
     fut = asyncio.run_coroutine_threadsafe(_get(), _loop)
     return fut.result(timeout=15), 200
+
+@app.get("/_loop")
+def loop_state():
+    alive = bool(_loop)
+    running = _loop.is_running() if _loop else False
+    return f"loop_alive={alive}, is_running={running}", 200
 
 @app.get("/health")
 def health():
@@ -278,4 +329,3 @@ def health():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
