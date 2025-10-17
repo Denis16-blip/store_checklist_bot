@@ -1,373 +1,176 @@
+
 import os
-import asyncio
+import json
 import threading
-from typing import Optional
+import asyncio
+from datetime import datetime
 
-from flask import Flask, request
+from flask import Flask, request, Response
 from dotenv import load_dotenv
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardRemove, InputMediaPhoto,
-)
+
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application, CallbackContext, CommandHandler,
-    CallbackQueryHandler, MessageHandler, filters,
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 
-# ───────────────────────────────────────────────────────────────────────────────
-# ENV
+import httpx  # для прямых вызовов Telegram API (диагностика)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# env & globals
+# ──────────────────────────────────────────────────────────────────────────────
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")  # для авто-/set-webhook
 
-# ───────────────────────────────────────────────────────────────────────────────
-# ЧЕК-ЛИСТ (редактируй под себя)
-CHECKLIST_BLOCKS = [
-    {"code": "assortment","title":"1) Общее размещение ассортимента","items":[
-        "Категории выстроены по зонированию",
-        "Коллекции разделены по брендам/направлениям",
-        "Переходные зоны нейтральны, без конфликта брендов",
-    ]},
-    {"code": "planograms","title":"2) Планограммы и баланс","items":[
-        "Планограммы актуальны и соответствуют наполнению",
-        "Баланс верхов/низов соблюдён",
-        "Развеска начинается с верхов, соблюдена комплектность",
-    ]},
-    {"code": "posm","title":"3) POSM и коммуникация","items":[
-        "Хедеры/логотипы установлены корректно",
-        "Графика соответствует текущей кампании",
-        "Устаревший POSM удалён, недостающее — в заявке",
-    ]},
-    {"code": "styling","title":"4) Стайлинг и кросс-мерч","items":[
-        "Каждый второй фронт поддержан образом/слоями",
-        "Ярлыки спрятаны, крючки по правилу правой руки",
-        "Зоны сбалансированы по высоте/цвету/плотности",
-    ]},
-    {"code":"mannequins","title":"5) Манекены","items":[
-        "Луки по сезону/погоде региона",
-        "Товары с манекенов есть в зале (размерная линейка)",
-        "Есть бестселлеры, образ завершён (аксессуары/цвет)",
-    ]},
-    {"code":"window","title":"6) Витрина","items":[
-        "Концепт соответствует активной кампании",
-        "Чистая витрина: стекло/декор без пыли/следов",
-        "Свет без пересветов/бликов, акцент на графике",
-    ]},
-]
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0") or 0)
+BASE_URL = os.getenv("BASE_URL", "").strip()
 
-# ───────────────────────────────────────────────────────────────────────────────
-# RAM-состояние
-USER_STATE = {}
+assert BOT_TOKEN, "BOT_TOKEN is required"
 
-# Flask + PTB
 app = Flask(__name__)
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is empty")
 
-application = Application.builder().token(BOT_TOKEN).build()
+# флаги/объекты фонового PTB
+_ptb_thread: threading.Thread | None = None
+_loop: asyncio.AbstractEventLoop | None = None
+_app: Application | None = None
+_loop_alive = False         # поток с loop создан
+_ptb_ready = False          # Application.initialize() прошла
 
-# ── helpers ────────────────────────────────────────────────────────────────────
-def start_payload(uid: int):
-    USER_STATE[uid] = {
-        "store": None, "current_block": 0, "current_item": 0,
-        "answers": {}, "photos": [],
-    }
+def log(msg: str):
+    print(f"[{datetime.utcnow().isoformat(timespec='seconds')}Z] {msg}", flush=True)
 
-def get_block_and_item(uid: int):
-    st = USER_STATE[uid]
-    block = CHECKLIST_BLOCKS[st["current_block"]]
-    item = block["items"][st["current_item"]]
-    return block, item
-
-def kb_yes_no():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Всё ок", callback_data="ans_ok"),
-         InlineKeyboardButton("⚠️ Замечание", callback_data="ans_warn")],
-        [InlineKeyboardButton("📸 Приложить фото", callback_data="add_photo")],
-    ])
-
-def kb_next():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("➡️ Далее", callback_data="next")]])
-
-def format_summary(uid: int):
-    st = USER_STATE[uid]
-    lines = ["📋 Итоговый отчёт"]
-    if st.get("store"): lines.append(f"🏬 Магазин: {st['store']}")
-    lines.append("")
-    total = ok = 0
-    for block in CHECKLIST_BLOCKS:
-        code = block["code"]
-        ans = st["answers"].get(code, [])
-        if not ans: continue
-        lines.append(f"*{block['title']}*")
-        for a in ans:
-            icon = "✅" if a["status"] == "ok" else "⚠️"
-            comment = f" — {a['comment']}" if a.get("comment") else ""
-            lines.append(f"{icon} {a['item']}{comment}")
-            total += 1
-            if a["status"] == "ok": ok += 1
-        lines.append("")
-    score = int((ok/total)*100) if total else 0
-    lines.append(f"🔢 Готовность: {score}% ({ok}/{total})")
-    return "\n".join(lines), score
-
-# ── handlers ───────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, context: CallbackContext):
-    print(">>> /start from", update.effective_user.id)
-    user_id = update.effective_user.id
-    start_payload(user_id)
-    await update.message.reply_text(
-        "Привет! Давай пройдём ежедневный чек-лист.\n\n"
-        "Сначала укажи магазин (например: ТЦ МЕГА Казань, или #23):"
+# ──────────────────────────────────────────────────────────────────────────────
+# Бизнес-логика бота (минимум для проверки)
+# ──────────────────────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [[InlineKeyboardButton("Проверка", callback_data="ping")]]
+    await update.effective_chat.send_message(
+        "Привет! Бот на вебхуке жив. Нажми кнопку или пришли /start ещё раз.",
+        reply_markup=InlineKeyboardMarkup(kb),
     )
 
-async def receive_store(update: Update, context: CallbackContext):
-    uid = update.effective_user.id
-    if uid not in USER_STATE: start_payload(uid)
-    USER_STATE[uid]["store"] = update.message.text.strip()
-    block, item = get_block_and_item(uid)
-    await update.message.reply_text(
-        f"*{block['title']}*\n\nПервый пункт:\n• {item}",
-        reply_markup=kb_yes_no(), parse_mode="Markdown"
-    )
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer("pong")
+    await update.callback_query.edit_message_text("Кнопка работает ✅")
 
-async def handle_callback(update: Update, context: CallbackContext):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    if uid not in USER_STATE: start_payload(uid)
-    st = USER_STATE[uid]
-    block, item = get_block_and_item(uid)
+def build_application() -> Application:
+    app_ = Application.builder().token(BOT_TOKEN).build()
+    app_.add_handler(CommandHandler("start", cmd_start))
+    app_.add_handler(CallbackQueryHandler(on_button))
+    return app_
 
-    if q.data in ("ans_ok","ans_warn"):
-        status = "ok" if q.data=="ans_ok" else "warn"
-        st["answers"].setdefault(block["code"], []).append(
-            {"item": item, "status": status, "comment": None}
-        )
-        await q.edit_message_text(
-            f"{block['title']}\n\n"
-            f"{'✅ Всё ок' if status=='ok' else '⚠️ Замечание'} — {item}\n\n"
-            "Есть комментарий? Напиши сообщением или нажми «Далее».",
-            reply_markup=kb_next()
-        ); return
+# ──────────────────────────────────────────────────────────────────────────────
+# Фоновый поток с отдельным asyncio-loop
+# ──────────────────────────────────────────────────────────────────────────────
+async def _ptb_init_async():
+    """Создать Application и выполнить initialize()."""
+    global _app, _ptb_ready
+    log("PTB: build application…")
+    _app = build_application()
+    log("PTB: application.initialize()…")
+    await _app.initialize()       # регистрирует хэндлеры, готовит bot/session
+    _ptb_ready = True
+    log("PTB: READY")
 
-    if q.data == "add_photo":
-        await q.edit_message_text(
-            f"{block['title']}\n\nПришли фото как изображение. После — нажми «Далее».",
-            reply_markup=kb_next()
-        ); return
-
-    if q.data == "next":
-        if st["current_item"]+1 < len(block["items"]):
-            st["current_item"] += 1
-        else:
-            st["current_item"] = 0
-            st["current_block"] += 1
-
-        if st["current_block"] >= len(CHECKLIST_BLOCKS):
-            summary, _ = format_summary(uid)
-            await q.edit_message_text(summary, parse_mode="Markdown")
-
-            if st["photos"]:
-                media = [InputMediaPhoto(pid) for pid in st["photos"][:10]]
-                try: await context.bot.send_media_group(chat_id=uid, media=media)
-                except Exception: pass
-
-            if ADMIN_ID:
-                try:
-                    await context.bot.send_message(chat_id=ADMIN_ID, text=summary, parse_mode="Markdown")
-                    if st["photos"]:
-                        media = [InputMediaPhoto(pid) for pid in st["photos"][:10]]
-                        await context.bot.send_media_group(chat_id=ADMIN_ID, media=media)
-                except Exception: pass
-
-            start_payload(uid); return
-
-        block, item = get_block_and_item(uid)
-        await q.edit_message_text(
-            f"*{block['title']}*\n\nСледующий пункт:\n• {item}",
-            reply_markup=kb_yes_no(), parse_mode="Markdown"
-        )
-
-async def save_comment(update: Update, context: CallbackContext):
-    uid = update.effective_user.id
-    if uid not in USER_STATE: return
-    st = USER_STATE[uid]
-    code = CHECKLIST_BLOCKS[st["current_block"]]["code"]
-    if st["answers"].get(code):
-        st["answers"][code][-1]["comment"] = update.message.text.strip()
-        await update.message.reply_text("📝 Комментарий сохранён. Нажми «Далее».",
-                                        reply_markup=ReplyKeyboardRemove())
-
-async def save_photo(update: Update, context: CallbackContext):
-    uid = update.effective_user.id
-    if not update.message.photo: return
-    file_id = update.message.photo[-1].file_id
-    USER_STATE.setdefault(uid, {}).setdefault("photos", []).append(file_id)
-    await update.message.reply_text("📸 Фото получено. Нажми «Далее».")
-
-application.add_handler(CommandHandler("start", cmd_start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_store), 0)
-application.add_handler(CallbackQueryHandler(handle_callback))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_comment), 1)
-application.add_handler(MessageHandler(filters.PHOTO, save_photo))
-
-# ───────────────────────────────────────────────────────────────────────────────
-# PTB в отдельном event loop + гарантированный старт и авто-вебхук
-_loop: Optional[asyncio.AbstractEventLoop] = None
-_ready = threading.Event()
-
-async def _try_with_timeout(coro, title: str, timeout: float = 15.0):
+def _ptb_thread_main():
+    """Запустить свой event loop и инициализировать PTB внутри него."""
+    global _loop, _loop_alive
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+    _loop_alive = True
+    log("PTB thread: loop created, initializing…")
     try:
-        return await asyncio.wait_for(coro, timeout=timeout)
-    except asyncio.TimeoutError:
-        print(f">>> timeout in {title} after {timeout}s — continue")
-    except Exception as e:
-        import traceback
-        print(f">>> error in {title}:", e)
-        traceback.print_exc()
-
-def _run_ptb_background():
-    global _loop
-    try:
-        print(">>> PTB thread: creating loop")
-        _loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_loop)
-
-        async def _boot():
-            print(">>> PTB thread: initialize()…")
-            await _try_with_timeout(application.initialize(), "application.initialize()")
-
-            print(">>> PTB thread: start()…")
-            await _try_with_timeout(application.start(), "application.start()")
-
-            # Бонус: проверка токена + авто-вебхук
-            try:
-                me = await _try_with_timeout(application.bot.get_me(), "bot.get_me()")
-                if me:
-                    print(f">>> PTB started as @{me.username} ({me.id})")
-                else:
-                    print(">>> PTB started (get_me() skipped)")
-
-                if BASE_URL:
-                    wb = await _try_with_timeout(
-                        application.bot.set_webhook(
-                            f"{BASE_URL}/",
-                            allowed_updates=["message","callback_query"]
-                        ), "bot.set_webhook()"
-                    )
-                    print(f">>> set_webhook to {BASE_URL}/ -> {bool(wb)}")
-            finally:
-                pass
-
-        _loop.run_until_complete(_boot())
-        _ready.set()
+        _loop.run_until_complete(_ptb_init_async())
+        # дальше loop просто живёт; никаких polling/start() нам не нужно
         _loop.run_forever()
     except Exception as e:
-        import traceback
-        print(">>> PTB thread crashed:", e)
-        traceback.print_exc()
-        _ready.set()  # чтобы диагностические роуты отвечали хотя бы состоянием
+        log(f"PTB thread ERROR: {e}")
+    finally:
+        _loop_alive = False
+        log("PTB thread: exit")
 
-def _ensure_thread_started():
-    if not _ready.is_set():
-        print(">>> PTB thread: starting…")
-        t = threading.Thread(target=_run_ptb_background, daemon=True)
-        t.start()
+def ensure_ptb_started():
+    global _ptb_thread
+    if _ptb_thread and _ptb_thread.is_alive():
+        return
+    _ptb_thread = threading.Thread(target=_ptb_thread_main, name="ptb-thread", daemon=True)
+    _ptb_thread.start()
+    log("PTB thread: started")
 
-# Стартуем фоном сразу при импорте (в воркере gunicorn)
-_ensure_thread_started()
-
-# ───────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Flask routes
-@app.post("/")
-def webhook():
-    """Вебхук Telegram."""
-    if not _ready.wait(timeout=3):
-        print(">>> webhook: loop not ready (503) — Telegram will retry")
-        return "loop not ready", 503
-
-    data = request.get_json(silent=True) or {}
-    try:
-        update = Update.de_json(data, application.bot)
-    except Exception as e:
-        print(">>> webhook: bad update json:", e, data)
-        return "bad update", 200
-
-    # Диаг-лог входящего
-    try:
-        ud = update.to_dict()
-        msg = ud.get("message") or ud.get("callback_query") or list(ud.keys())
-        print(">>> incoming update:", msg)
-    except Exception:
-        print(">>> incoming update (no dict)")
-
-    # Временный пульс-ответ
-    try:
-        if update.message and update.message.chat and update.message.text:
-            asyncio.run_coroutine_threadsafe(
-                application.bot.send_message(
-                    chat_id=update.message.chat.id,
-                    text="✅ Webhook OK (я тебя слышу). Жми /start — пойдём по чек-листу."
-                ),
-                _loop
-            )
-    except Exception as e:
-        print(">>> direct reply error:", e)
-
-    # Отдаём апдейт PTB
-    try:
-        asyncio.run_coroutine_threadsafe(application.process_update(update), _loop)
-    except Exception as e:
-        print(">>> process_update error:", e)
-
-    return "ok", 200
-
-@app.get("/set-webhook")
-def set_webhook():
-    if not _ready.wait(timeout=3):
-        return "loop not ready", 503
-
-    async def _set():
-        return await application.bot.set_webhook(
-            f"{BASE_URL}/",
-            allowed_updates=["message", "callback_query"]
-        )
-    fut = asyncio.run_coroutine_threadsafe(_set(), _loop)
-    ok = fut.result(timeout=20)
-    return f"Webhook set to {BASE_URL}/ -> {ok}", 200
-
-@app.get("/getwebhookinfo")
-def get_webhook_info():
-    if not _ready.wait(timeout=3):
-        return "loop not ready", 503
-
-    async def _info():
-        i = await application.bot.get_webhook_info()
-        return f"url={i.url} pending={i.pending_update_count} last_error={i.last_error_message}"
-    fut = asyncio.run_coroutine_threadsafe(_info(), _loop)
-    return fut.result(timeout=20), 200
-
-@app.get("/whoami")
-def whoami():
-    if not _ready.wait(timeout=3):
-        return "loop not ready", 503
-    async def _get():
-        me = await application.bot.get_me()
-        return f"Bot: @{me.username} (id: {me.id})"
-    fut = asyncio.run_coroutine_threadsafe(_get(), _loop)
-    return fut.result(timeout=15), 200
-
-@app.get("/_loop")
-def loop_state():
-    alive = bool(_loop)
-    running = _loop.is_running() if _loop else False
-    return f"loop_alive={alive}, is_running={running}", 200
-
-@app.get("/health")
+# ──────────────────────────────────────────────────────────────────────────────
+@app.route("/health")
 def health():
     return "ok", 200
 
+@app.route("/_loop")
+def loop_state():
+    return f"loop_alive={_loop_alive}, is_running={bool(_loop and _loop.is_running())}", 200
+
+@app.route("/diag")
+def diag():
+    info = {
+        "loop_alive": _loop_alive,
+        "loop_is_running": bool(_loop and _loop.is_running()),
+        "ptb_ready": _ptb_ready,
+        "has_application": _app is not None,
+        "now": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    return app.response_class(json.dumps(info, ensure_ascii=False, indent=2), mimetype="application/json")
+
+@app.route("/getwebhookinfo_raw")
+def getwebhookinfo_raw():
+    """Прямой вызов Telegram API без PTB/loop — для диагностики."""
+    try:
+        r = httpx.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo", timeout=10)
+        return app.response_class(r.text, mimetype="application/json", status=r.status_code)
+    except Exception as e:
+        return f"error: {e}", 500
+
+@app.route("/set-webhook")
+def set_webhook():
+    """Удобно дергать из браузера после деплоя."""
+    target = BASE_URL.rstrip("/") + "/"
+    try:
+        r = httpx.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+            params={"url": target},
+            timeout=15,
+        )
+        log(f"setWebhook → {r.status_code} {r.text[:200]}")
+        return f"Webhook set to {target}", 200
+    except Exception as e:
+        log(f"setWebhook ERROR: {e}")
+        return f"error: {e}", 500
+
+@app.post("/")
+def telegram_webhook():
+    """Телега шлёт JSON сюда. Гоним апдейт в PTB через loop из фонового потока."""
+    if not (_loop_alive and _ptb_ready and _app and _loop):
+        # Телега сама ретраит; отдаём 503, пока PTB не готов.
+        log("webhook → loop not ready (503)")
+        return Response("loop not ready", status=503)
+
+    try:
+        data = request.get_json(force=True, silent=False)
+        upd = Update.de_json(data, _app.bot)
+        fut = asyncio.run_coroutine_threadsafe(_app.process_update(upd), _loop)
+        # ждать не нужно — главное успешно поставить таску
+        fut.add_done_callback(lambda f: None)  # чтобы не висели предупреждения
+        return "ok", 200
+    except Exception as e:
+        log(f"webhook ERROR: {e}")
+        return Response("internal error", status=500)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# App startup
+# ──────────────────────────────────────────────────────────────────────────────
+@app.before_request
+def _before_any():
+    # гарантируем запуск фонового потока как только приходит первый запрос
+    ensure_ptb_started()
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # локальный запуск
+    ensure_ptb_started()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
