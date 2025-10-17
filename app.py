@@ -1,4 +1,4 @@
-# app.py
+
 import os
 import asyncio
 import traceback
@@ -59,7 +59,6 @@ last_ptb_error: Optional[str] = None  # текст последней ошибк
 # ──────────────────────────────────────────────────────────────────────────────
 # ЧЕК-ЛИСТ (СТРОГО ПО PPTX, разбивка на тезисы)
 # ──────────────────────────────────────────────────────────────────────────────
-
 SECTIONED_ITEMS: List[Dict[str, Any]] = [
     {
         "section": "1. ОБЩЕЕ РАЗМЕЩЕНИЕ АССОРТИМЕНТА",
@@ -441,7 +440,6 @@ def _ptb_thread():
             ptb_ready.clear()
             if application:
                 if ptb_loop and ptb_loop.is_running():
-                    # normal path won't be here
                     pass
                 if ptb_loop:
                     ptb_loop.run_until_complete(application.stop())
@@ -463,6 +461,27 @@ def ensure_ptb_thread():
 
 # Запускаем PTB-тред при импортe (под gunicorn = 1 воркер)
 ensure_ptb_thread()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ГАРАНТИРОВАННЫЙ ПУСК И РУЧНОЙ РЕСТАРТ PTB-ТРЕДА
+# ──────────────────────────────────────────────────────────────────────────────
+@app.before_first_request
+def _kick_ptb_on_first_request():
+    try:
+        print(">>> before_first_request: ensure_ptb_thread()")
+        ensure_ptb_thread()
+    except Exception as e:
+        print(">>> before_first_request error:", e)
+
+@app.get("/_restart_ptb")
+def restart_ptb():
+    # если не поднят — поднимем
+    if not ptb_ready.is_set():
+        print(">>> manual restart: ensure_ptb_thread()")
+        ensure_ptb_thread()
+        return jsonify({"ok": True, "action": "started"}), 200
+    # уже бежит
+    return jsonify({"ok": True, "action": "already_running"}), 200
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Flask endpoints (все синхронные)
