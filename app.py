@@ -19,10 +19,10 @@ from telegram.ext import (
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
-BASE_URL = os.getenv("BASE_URL", "")  # для /set-webhook
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")  # для авто-/set-webhook
 
 # ───────────────────────────────────────────────────────────────────────────────
-# ЧЕК-ЛИСТ (можно редактировать)
+# ЧЕК-ЛИСТ (редактируй под себя)
 CHECKLIST_BLOCKS = [
     {"code": "assortment","title":"1) Общее размещение ассортимента","items":[
         "Категории выстроены по зонированию",
@@ -114,7 +114,7 @@ def format_summary(uid: int):
 
 # ── handlers ───────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: CallbackContext):
-    print(">>> /start received from", update.effective_user.id)
+    print(">>> /start from", update.effective_user.id)
     user_id = update.effective_user.id
     start_payload(user_id)
     await update.message.reply_text(
@@ -214,9 +214,19 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_com
 application.add_handler(MessageHandler(filters.PHOTO, save_photo))
 
 # ───────────────────────────────────────────────────────────────────────────────
-# PTB в отдельном event loop + гарантированный старт
+# PTB в отдельном event loop + гарантированный старт и авто-вебхук
 _loop: Optional[asyncio.AbstractEventLoop] = None
 _ready = threading.Event()
+
+async def _try_with_timeout(coro, title: str, timeout: float = 15.0):
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        print(f">>> timeout in {title} after {timeout}s — continue")
+    except Exception as e:
+        import traceback
+        print(f">>> error in {title}:", e)
+        traceback.print_exc()
 
 def _run_ptb_background():
     global _loop
@@ -227,10 +237,29 @@ def _run_ptb_background():
 
         async def _boot():
             print(">>> PTB thread: initialize()…")
-            await application.initialize()
+            await _try_with_timeout(application.initialize(), "application.initialize()")
+
             print(">>> PTB thread: start()…")
-            await application.start()
-            print(">>> PTB started")
+            await _try_with_timeout(application.start(), "application.start()")
+
+            # Бонус: проверка токена + авто-вебхук
+            try:
+                me = await _try_with_timeout(application.bot.get_me(), "bot.get_me()")
+                if me:
+                    print(f">>> PTB started as @{me.username} ({me.id})")
+                else:
+                    print(">>> PTB started (get_me() skipped)")
+
+                if BASE_URL:
+                    wb = await _try_with_timeout(
+                        application.bot.set_webhook(
+                            f"{BASE_URL}/",
+                            allowed_updates=["message","callback_query"]
+                        ), "bot.set_webhook()"
+                    )
+                    print(f">>> set_webhook to {BASE_URL}/ -> {bool(wb)}")
+            finally:
+                pass
 
         _loop.run_until_complete(_boot())
         _ready.set()
@@ -239,7 +268,7 @@ def _run_ptb_background():
         import traceback
         print(">>> PTB thread crashed:", e)
         traceback.print_exc()
-        _ready.set()  # чтобы /_loop что-то показал
+        _ready.set()  # чтобы диагностические роуты отвечали хотя бы состоянием
 
 def _ensure_thread_started():
     if not _ready.is_set():
@@ -254,10 +283,9 @@ _ensure_thread_started()
 # Flask routes
 @app.post("/")
 def webhook():
-    """Вебхук Telegram: логируем, шлём быстрый ответ и отдаём апдейт в PTB."""
+    """Вебхук Telegram."""
     if not _ready.wait(timeout=3):
-        # луп ещё не готов — отдаём 503, чтобы Telegram повторил апдейт
-        print(">>> webhook: loop not ready, returning 503 to retry")
+        print(">>> webhook: loop not ready (503) — Telegram will retry")
         return "loop not ready", 503
 
     data = request.get_json(silent=True) or {}
@@ -267,25 +295,28 @@ def webhook():
         print(">>> webhook: bad update json:", e, data)
         return "bad update", 200
 
-    print(">>> incoming update:",
-          (update.to_dict().get("message") or
-           update.to_dict().get("callback_query") or
-           list(update.to_dict().keys())))
+    # Диаг-лог входящего
+    try:
+        ud = update.to_dict()
+        msg = ud.get("message") or ud.get("callback_query") or list(ud.keys())
+        print(">>> incoming update:", msg)
+    except Exception:
+        print(">>> incoming update (no dict)")
 
-    # Временный "пульс": сразу ответим пользователю, если это текст
+    # Временный пульс-ответ
     try:
         if update.message and update.message.chat and update.message.text:
             asyncio.run_coroutine_threadsafe(
                 application.bot.send_message(
                     chat_id=update.message.chat.id,
-                    text="✅ Webhook OK (я тебя слышу). Сейчас подключаю сценарий…"
+                    text="✅ Webhook OK (я тебя слышу). Жми /start — пойдём по чек-листу."
                 ),
                 _loop
             )
     except Exception as e:
         print(">>> direct reply error:", e)
 
-    # Основной путь: отдаём апдейт в PTB
+    # Отдаём апдейт PTB
     try:
         asyncio.run_coroutine_threadsafe(application.process_update(update), _loop)
     except Exception as e:
@@ -299,13 +330,24 @@ def set_webhook():
         return "loop not ready", 503
 
     async def _set():
-        await application.bot.set_webhook(
+        return await application.bot.set_webhook(
             f"{BASE_URL}/",
             allowed_updates=["message", "callback_query"]
         )
     fut = asyncio.run_coroutine_threadsafe(_set(), _loop)
-    fut.result(timeout=15)
-    return f"Webhook set to {BASE_URL}/", 200
+    ok = fut.result(timeout=20)
+    return f"Webhook set to {BASE_URL}/ -> {ok}", 200
+
+@app.get("/getwebhookinfo")
+def get_webhook_info():
+    if not _ready.wait(timeout=3):
+        return "loop not ready", 503
+
+    async def _info():
+        i = await application.bot.get_webhook_info()
+        return f"url={i.url} pending={i.pending_update_count} last_error={i.last_error_message}"
+    fut = asyncio.run_coroutine_threadsafe(_info(), _loop)
+    return fut.result(timeout=20), 200
 
 @app.get("/whoami")
 def whoami():
