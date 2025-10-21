@@ -5,6 +5,7 @@ import threading
 import asyncio
 from datetime import datetime
 from pathlib import Path
+import html  # ← для безопасного экранирования в HTML
 
 from flask import Flask, request, Response
 from dotenv import load_dotenv
@@ -69,14 +70,14 @@ STORE_CATALOG: dict[str, str] = {
     "C08E": "RU_SAINT-PETERSBURG_Galereya_SPORT",
     "C0WF": "RU_PERM_Planeta_SPORT",
     "C0VB": "RU_OMSK_Mega_SPORT",
-    "C00X": "RU_ABAKAN_Ametист_SPORT",
+    "C00X": "RU_ABAKAN_Ametist_SPORT",
     "C0JP": "RU_IRKUTSK_ModnyKvartal_SPORT",
     "C00K": "RU_NOVOSIBIRSK_TTSAura_SPORT",
     "C0EI": "RU_SURGUT_Aura_SPORT",
     "C002": "RU_YUZHNO-SAKHALINSK_SitiMoll_SPORT",
     "C082": "RU_GELENDZHIK_Lenina_SPORT",
-    "C0JN": "RU_KRASNODАР_Galereya_SPORT",
-    "C0BW": "RU_KRASNODАР_OzMoll_SPORT",
+    "C0JN": "RU_KRASNODAR_Galereya_SPORT",
+    "C0BW": "RU_KRASNODAR_OzMoll_SPORT",
     "C0VN": "RU_NOVOROSSIYSK_KrasnayaPloshchad_SPORT",
     "C081": "RU_SARATOV_TriumfMoll_SPORT",
     "C0WE": "RU_SOCHI_MoreMoll_SPORT",
@@ -255,7 +256,7 @@ def _fmt_progress_text(st) -> str:
     for si, sec in enumerate(CHECKLIST):
         sec_total = len(sec["items"])
         sec_done = sum(1 for ii in range(sec_total) if st["marks"].get(si, {}).get(ii) is True)
-        tick = "✅" if sec_done == sec_total and сек_total > 0 else ("➖" if sec_done else "⬜️")
+        tick = "✅" if sec_done == sec_total and sec_total > 0 else ("➖" if sec_done else "⬜️")
         lines.append(f"{tick} {sec['title']} — {sec_done}/{sec_total}")
     return "\n".join(lines)
 
@@ -286,16 +287,19 @@ def _role_from_secret(secret: str) -> str | None:
     return None
 
 async def _notify_admin_new(context: ContextTypes.DEFAULT_TYPE, req_id: str):
+    """Отправка заявки админу — теперь HTML + экранирование, чтобы не падало на '_'."""
     if not ADMIN_ID:
         return
     r = PENDING[req_id]
+    # экранируем всё динамическое
+    esc = lambda s: html.escape(str(s or ""))
     text = (
-        "🆕 *Заявка на доступ*\n"
-        f"Req: `{req_id}`\n"
-        f"User: `{r['user_id']}` @{r.get('username','')} — {r.get('name','')}\n"
-        f"Магазин: *{r['store']}* — {STORE_CATALOG.get(r['store'],'?')}\n"
-        f"Роль: *{r['role']}*\n"
-        f"Время (UTC): {r['ts']}"
+        "<b>🆕 Заявка на доступ</b>\n"
+        f"Req: <code>{esc(req_id)}</code>\n"
+        f"User: <code>{esc(r['user_id'])}</code> @{esc(r.get('username',''))} — {esc(r.get('name',''))}\n"
+        f"Магазин: <b>{esc(r['store'])}</b> — {esc(STORE_CATALOG.get(r['store'],'?'))}\n"
+        f"Роль: <b>{esc(r['role'])}</b>\n"
+        f"Время (UTC): {esc(r['ts'])}"
     )
     kb = InlineKeyboardMarkup([
         [
@@ -303,7 +307,7 @@ async def _notify_admin_new(context: ContextTypes.DEFAULT_TYPE, req_id: str):
             InlineKeyboardButton("❌ Отклонить", callback_data=f"reg:reject:{req_id}"),
         ]
     ])
-    await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown", reply_markup=kb)
+    await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=kb)
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -361,6 +365,7 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _notify_admin_new(context, req_id)
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список заявок — тоже HTML + экранирование."""
     u = update.effective_user
     if not is_admin(u.id):
         await update.effective_chat.send_message("Команда только для администратора.")
@@ -368,13 +373,15 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not PENDING:
         await update.effective_chat.send_message("Очередь пуста ✅")
         return
-    lines = ["*Ожидают модерации:*"]
+    esc = lambda s: html.escape(str(s or ""))
+    lines = ["<b>Ожидают модерации:</b>"]
     for req_id, r in sorted(PENDING.items()):
         lines.append(
-            f"• `{req_id}` — user `{r['user_id']}` @{r.get('username','')} — {r.get('name','')}, "
-            f"роль *{r['role']}*, магазин *{r['store']}*"
+            f"• <code>{esc(req_id)}</code> — user <code>{esc(r['user_id'])}</code> "
+            f"@{esc(r.get('username',''))} — {esc(r.get('name',''))}, "
+            f"роль <b>{esc(r['role'])}</b>, магазин <b>{esc(r['store'])}</b>"
         )
-    await update.effective_chat.send_message("\n".join(lines), parse_mode="Markdown")
+    await update.effective_chat.send_message("\n".join(lines), parse_mode="HTML")
 
 async def reg_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -405,15 +412,16 @@ async def reg_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await q.answer("Одобрено ✅")
         try:
-            await q.edit_message_text(q.message.text + "\n\n*🔔 Статус: одобрено.*", parse_mode="Markdown")
+            await q.edit_message_text(q.message.text + "\n\n<b>🔔 Статус: одобрено.</b>", parse_mode="HTML")
         except Exception:
             pass
         # Уведомления
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"✅ Доступ одобрен администратором.\nРоль: *{prof['role']}*, магазин: *{prof['current_store']}*.",
-                parse_mode="Markdown",
+                text=f"✅ Доступ одобрен администратором.\nРоль: <b>{html.escape(prof['role'])}</b>, "
+                     f"магазин: <b>{html.escape(prof['current_store'])}</b>.",
+                parse_mode="HTML",
             )
         except Exception as e:
             log(f"notify user approve error: {e}")
@@ -424,7 +432,7 @@ async def reg_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_pending()
         await q.answer("Отклонено ❌")
         try:
-            await q.edit_message_text(q.message.text + "\n\n*🔔 Статус: отклонено.*", parse_mode="Markdown")
+            await q.edit_message_text(q.message.text + "\n\n<b>🔔 Статус: отклонено.</b>", parse_mode="HTML")
         except Exception:
             pass
         try:
@@ -783,7 +791,5 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
-
-
 
 
