@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
-    MessageHandler, filters,   # ← ДОБАВЛЕНО
+    MessageHandler, filters,
 )
 
 import httpx  # для прямых вызовов Telegram API (диагностика)
@@ -125,6 +125,22 @@ CHECKLIST = [
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Примеры-фото для разделов (зашитые file_id)
+# Индексация соответствует CHECKLIST:
+# 0 — Общее размещение, 1 — Кросс-мерч, 2 — Наполненность, 3 — Манекены,
+# 4 — Витрина, 5 — Чистая касса, 6 — Освещение.
+# ──────────────────────────────────────────────────────────────────────────────
+EXAMPLE_PHOTOS: dict[int, list[str]] = {
+    0: ["AgACAgIAAxkBAAN-aPc9fUdYqxNInDdLrh01UHckFW0AApL-MRvGH7hLzIOseULYaQ0BAAMCAAN4AAM2BA"],  # Общее размещение
+    1: ["AgACAgIAAxkBAAN7aPc9WeexQm229VrzIW07tL18TccAAo3-MRvGH7hLuY3p8Zmreq8BAAMCAAN4AAM2BA"],  # Кросс-мерч/стайлинг
+    2: ["AgACAgIAAxkBAAN9aPc9dabPgwhMuqDyMuCP52xNiZoAApH-MRvGH7hLayPbIRcX4O0BAAMCAAN4AAM2BA"],  # Наполненность/пополнение
+    3: ["AgACAgIAAxkBAAN8aPc9bcea5a-h24wkS-zxpUBbdH4AApD-MRvGH7hLc0mtlweQiY4BAAMCAAN4AAM2BA"],  # Манекены
+    # 4 (Витрина) — пока без примера, можно добавить позже
+    5: ["AgACAgIAAxkBAAOAaPc9jBeS7KupdZWKttfeHrjT0YAAApT-MRvGH7hLYmedyzrqAAHaAQADAgADeAADNgQ"],  # Чистая кассовая зона
+    6: ["AgACAgIAAxkBAAN_aPc9hXcYmK--YdH5wyJGthZp7kIAApP-MRvGH7hLalo9O7bUB34BAAMCAAN4AAM2BA"],  # Освещение
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Состояние чек-листа (поквартально/секциями)
 # ──────────────────────────────────────────────────────────────────────────────
 # Для каждого чата храним:
@@ -184,10 +200,16 @@ def _kb_section(si: int, st):
         InlineKeyboardButton("↩ Пропустить секцию", callback_data="cl:skip"),
     ]
     rows.append(controls)
-    rows.append([
-        InlineKeyboardButton("♻️ Сброс секции", callback_data="cl:resetsec"),
-        InlineKeyboardButton("📋 Прогресс", callback_data="cl:progress"),
-    ])
+
+    # Доп. действия
+    extras = [InlineKeyboardButton("📋 Прогресс", callback_data="cl:progress")]
+    if si in EXAMPLE_PHOTOS:
+        extras.insert(0, InlineKeyboardButton("📷 Пример", callback_data="cl:photo"))
+    rows.append(extras)
+
+    # Сброс
+    rows.append([InlineKeyboardButton("♻️ Сброс секции", callback_data="cl:resetsec")])
+
     return InlineKeyboardMarkup(rows)
 
 def _fmt_progress_text(st) -> str:
@@ -257,6 +279,24 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action == "photo":
+        # отправим пример, если он есть
+        files = EXAMPLE_PHOTOS.get(si)
+        if files:
+            try:
+                await q.message.chat.send_photo(
+                    photo=files[0],
+                    caption=f"Пример для секции: {CHECKLIST[si]['title']}"
+                )
+            except Exception as e:
+                log(f"send_photo error: {e}")
+                await q.answer("Не удалось отправить фото", show_alert=True)
+                return
+            await q.answer("Пример отправлен")
+        else:
+            await q.answer("Для этой секции пока нет примера", show_alert=True)
+        return
+
     if action.startswith("toggle:"):
         # переключаем состояние конкретного пункта секции: None -> True -> False -> None
         ii = int(action.split(":")[1])
@@ -313,79 +353,6 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 🔎 РЕЖИМ СБОРА file_id ДЛЯ ФОТО (АДМИН)
-# ──────────────────────────────────────────────────────────────────────────────
-# Для каждого чата можно включить режим сбора,
-# чтобы админ мог накидать до N фото и получить их file_id.
-_photo_collect_state: dict[int, dict] = {}  # chat_id -> {"active": bool, "target": int, "ids": []}
-
-def _is_admin(update: Update) -> bool:
-    user = update.effective_user
-    return bool(user and ADMIN_ID and user.id == ADMIN_ID)
-
-async def cmd_photo_ids_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        return
-    chat_id = update.effective_chat.id
-    target = 6  # собираем 6 фото
-    _photo_collect_state[chat_id] = {"active": True, "target": target, "ids": []}
-    await update.effective_chat.send_message(
-        f"Режим сбора file_id включён. Пришлите {target} фото (по одному). Я верну file_id каждого. "
-        f"Команды: /photo_ids_status, /photo_ids_stop"
-    )
-
-async def cmd_photo_ids_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        return
-    chat_id = update.effective_chat.id
-    st = _photo_collect_state.get(chat_id)
-    if not st or not st.get("active"):
-        await update.effective_chat.send_message("Режим сбора уже выключен.")
-        return
-    st["active"] = False
-    await update.effective_chat.send_message("Режим сбора file_id выключен.")
-
-async def cmd_photo_ids_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        return
-    chat_id = update.effective_chat.id
-    st = _photo_collect_state.get(chat_id, {"active": False, "ids": [], "target": 6})
-    await update.effective_chat.send_message(
-        f"Состояние: {'включён' if st.get('active') else 'выключен'} | "
-        f"Собрано: {len(st.get('ids', []))}/{st.get('target', 6)}\n"
-        f"IDs: {json.dumps(st.get('ids', []), ensure_ascii=False)}"
-    )
-
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Реагируем на фото только если режим сбора активен и отправитель — админ."""
-    if not _is_admin(update):
-        return
-    chat_id = update.effective_chat.id
-    st = _photo_collect_state.get(chat_id)
-    if not st or not st.get("active"):
-        return
-
-    msg = update.effective_message
-    if not msg or not msg.photo:
-        return
-
-    # Берём самое большое превью (последний элемент)
-    file_id = msg.photo[-1].file_id
-    st["ids"].append(file_id)
-    await update.effective_chat.send_message(f"✅ file_id сохранён:\n`{file_id}`", parse_mode="Markdown")
-
-    # Проверим, достигли ли лимита
-    if len(st["ids"]) >= st["target"]:
-        st["active"] = False
-        ids_json = json.dumps(st["ids"], ensure_ascii=False, indent=2)
-        await update.effective_chat.send_message(
-            "🎯 Собрано нужное количество фото. Режим отключён.\n"
-            "Список для копирования:\n"
-            f"```\n{ids_json}\n```",
-            parse_mode="Markdown",
-        )
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Регистрация хэндлеров
 # ──────────────────────────────────────────────────────────────────────────────
 def build_application() -> Application:
@@ -395,17 +362,11 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("start", cmd_start))
     app_.add_handler(CommandHandler("checklist", cmd_checklist))
 
-    # Админ-команды для сбора file_id
-    app_.add_handler(CommandHandler("photo_ids_start", cmd_photo_ids_start))
-    app_.add_handler(CommandHandler("photo_ids_stop", cmd_photo_ids_stop))
-    app_.add_handler(CommandHandler("photo_ids_status", cmd_photo_ids_status))
-
     # Кнопки
     app_.add_handler(CallbackQueryHandler(on_button))
     app_.add_handler(CallbackQueryHandler(cl_callback, pattern=r"^cl:"))
 
-    # Фото — в самом конце, чтобы не мешать остальному
-    app_.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    # (Фото-хэндлер и команды сбора file_id удалены — больше не нужны)
 
     return app_
 
@@ -524,5 +485,6 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
 
 
