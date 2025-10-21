@@ -69,7 +69,7 @@ STORE_CATALOG: dict[str, str] = {
     "C08E": "RU_SAINT-PETERSBURG_Galereya_SPORT",
     "C0WF": "RU_PERM_Planeta_SPORT",
     "C0VB": "RU_OMSK_Mega_SPORT",
-    "C00X": "RU_ABAKAN_Ametist_SPORT",
+    "C00X": "RU_ABAKAN_Ametист_SPORT",
     "C0JP": "RU_IRKUTSK_ModnyKvartal_SPORT",
     "C00K": "RU_NOVOSIBIRSK_TTSAura_SPORT",
     "C0EI": "RU_SURGUT_Aura_SPORT",
@@ -255,7 +255,7 @@ def _fmt_progress_text(st) -> str:
     for si, sec in enumerate(CHECKLIST):
         sec_total = len(sec["items"])
         sec_done = sum(1 for ii in range(sec_total) if st["marks"].get(si, {}).get(ii) is True)
-        tick = "✅" if sec_done == sec_total and sec_total > 0 else ("➖" if sec_done else "⬜️")
+        tick = "✅" if sec_done == sec_total and сек_total > 0 else ("➖" if sec_done else "⬜️")
         lines.append(f"{tick} {sec['title']} — {sec_done}/{sec_total}")
     return "\n".join(lines)
 
