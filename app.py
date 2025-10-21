@@ -5,7 +5,7 @@ import threading
 import asyncio
 from datetime import datetime
 from pathlib import Path
-import html  # ← для безопасного экранирования в HTML
+import html  # для экранирования в HTML
 
 from flask import Flask, request, Response
 from dotenv import load_dotenv
@@ -72,7 +72,7 @@ STORE_CATALOG: dict[str, str] = {
     "C0VB": "RU_OMSK_Mega_SPORT",
     "C00X": "RU_ABAKAN_Ametist_SPORT",
     "C0JP": "RU_IRKUTSK_ModnyKvartal_SPORT",
-    "C00K": "RU_NOVOSIBIRSK_TTSAura_SPORT",
+    "C00K": "RU_NOVОSIBIRSK_TTSAura_SPORT",
     "C0EI": "RU_SURGUT_Aura_SPORT",
     "C002": "RU_YUZHNO-SAKHALINSK_SitiMoll_SPORT",
     "C082": "RU_GELENDZHIK_Lenina_SPORT",
@@ -287,11 +287,9 @@ def _role_from_secret(secret: str) -> str | None:
     return None
 
 async def _notify_admin_new(context: ContextTypes.DEFAULT_TYPE, req_id: str):
-    """Отправка заявки админу — теперь HTML + экранирование, чтобы не падало на '_'."""
     if not ADMIN_ID:
         return
     r = PENDING[req_id]
-    # экранируем всё динамическое
     esc = lambda s: html.escape(str(s or ""))
     text = (
         "<b>🆕 Заявка на доступ</b>\n"
@@ -332,7 +330,6 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_chat.send_message("Неверный секрет роли. Проверь у администратора.")
         return
 
-    # Если сам админ регистрируется — одобряем сразу
     if is_admin(u.id):
         prof = get_profile(u.id)
         prof["role"] = role
@@ -345,7 +342,6 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Создаём заявку
     req_id = _gen_req_id(u.id)
     PENDING[req_id] = {
         "user_id": u.id,
@@ -365,7 +361,6 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _notify_admin_new(context, req_id)
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Список заявок — тоже HTML + экранирование."""
     u = update.effective_user
     if not is_admin(u.id):
         await update.effective_chat.send_message("Команда только для администратора.")
@@ -406,7 +401,6 @@ async def reg_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prof["role"] = r["role"]
         prof["current_store"] = r["store"]
         _save_staff()
-        # Удаляем из очереди
         del PENDING[req_id]
         _save_pending()
 
@@ -415,7 +409,6 @@ async def reg_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(q.message.text + "\n\n<b>🔔 Статус: одобрено.</b>", parse_mode="HTML")
         except Exception:
             pass
-        # Уведомления
         try:
             await context.bot.send_message(
                 chat_id=user_id,
@@ -464,7 +457,6 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Без Markdown — чтоб подчёркивания в названиях не ломали разметку
     lines = ["Коды магазинов:"]
     for code, name in sorted(STORE_CATALOG.items()):
         lines.append(f"{code} — {name}")
@@ -544,6 +536,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.data:
         return
+    # не трогаем модерацию — пусть обработает reg_callbacks
+    if q.data.startswith("reg:"):
+        return
     if q.data == "ping":
         await q.answer("pong")
         try:
@@ -561,7 +556,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     prof = get_profile(u.id)
-    # админ тоже может проходить чек-лист
     if not (prof["role"] == "auditor" or is_admin(u.id)):
         await update.effective_chat.send_message("Твоя роль — viewer. Для прохождения чек-листа нужна роль auditor.")
         return
@@ -583,7 +577,6 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = q.from_user
     prof = get_profile(u.id)
 
-    # админ тоже может
     if not (prof["role"] == "auditor" or is_admin(u.id)):
         await q.answer("Недостаточно прав", show_alert=True)
         return
@@ -660,6 +653,7 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────────────────────────
 def build_application() -> Application:
     app_ = Application.builder().token(BOT_TOKEN).build()
+    # команды
     app_.add_handler(CommandHandler("start", cmd_start))
     app_.add_handler(CommandHandler("register", cmd_register))
     app_.add_handler(CommandHandler("pending", cmd_pending))
@@ -668,9 +662,10 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("stores", cmd_stores))
     app_.add_handler(CommandHandler("setstore", cmd_setstore))
     app_.add_handler(CommandHandler("setrole", cmd_setrole))
-    app_.add_handler(CallbackQueryHandler(on_button))
+    # СНАЧАЛА — специфические callback-и, потом общий.
     app_.add_handler(CallbackQueryHandler(reg_callbacks, pattern=r"^reg:"))
     app_.add_handler(CallbackQueryHandler(cl_callback, pattern=r"^cl:"))
+    app_.add_handler(CallbackQueryHandler(on_button, block=False))  # общий, НЕ блокирует
     return app_
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -791,5 +786,3 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
-
-
