@@ -75,8 +75,8 @@ STORE_CATALOG: dict[str, str] = {
     "C0EI": "RU_SURGUT_Aura_SPORT",
     "C002": "RU_YUZHNO-SAKHALINSK_SitiMoll_SPORT",
     "C082": "RU_GELENDZHIK_Lenina_SPORT",
-    "C0JN": "RU_KRASNODAR_Galereya_SPORT",
-    "C0BW": "RU_KRASNODAR_OzMoll_SPORT",
+    "C0JN": "RU_KRASNODАР_Galereya_SPORT",
+    "C0BW": "RU_KRASNODАР_OzMoll_SPORT",
     "C0VN": "RU_NOVOROSSIYSK_KrasnayaPloshchad_SPORT",
     "C081": "RU_SARATOV_TriumfMoll_SPORT",
     "C0WE": "RU_SOCHI_MoreMoll_SPORT",
@@ -138,7 +138,7 @@ def must_have_store(update: Update, prof: dict) -> str | None:
     return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Чек-лист и фото (без изменений функционально)
+# Чек-лист и фото
 # ──────────────────────────────────────────────────────────────────────────────
 CHECKLIST = [
     {"title": "1. ОБЩЕЕ РАЗМЕЩЕНИЕ АССОРТИМЕНТА", "items": [
@@ -439,6 +439,9 @@ async def reg_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────────────────────────
 # Команды профиля/магазинов
 # ──────────────────────────────────────────────────────────────────────────────
+def _role_for_display(uid: int, prof: dict) -> str:
+    return "admin" if is_admin(uid) else prof.get("role", "viewer")
+
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     prof = get_profile(u.id)
@@ -446,17 +449,18 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur_name = STORE_CATALOG.get(cur, "—") if cur else "—"
     await update.effective_chat.send_message(
         f"🧾 Профиль\nID: `{u.id}`\n"
-        f"Роль: *{prof['role']}*\n"
+        f"Роль: *{_role_for_display(u.id, prof)}*\n"
         f"Магазин: *{cur or '—'}* — {cur_name}\n"
         f"Доступные магазины: {', '.join(prof['stores']) if prof['stores'] else 'не ограничено'}",
         parse_mode="Markdown",
     )
 
 async def cmd_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = ["*Коды магазинов:*"]
+    # Без Markdown — чтоб подчёркивания в названиях не ломали разметку
+    lines = ["Коды магазинов:"]
     for code, name in sorted(STORE_CATALOG.items()):
-        lines.append(f"`{code}` — {name}")
-    await update.effective_chat.send_message("\n".join(lines), parse_mode="Markdown")
+        lines.append(f"{code} — {name}")
+    await update.effective_chat.send_message("\n".join(lines))
 
 async def cmd_setstore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -522,7 +526,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Регистрация теперь с модерацией:\n"
         "• /register <КОД_МАГАЗИНА> <СЕКРЕТ_РОЛИ>\n"
         "• или deep-link t.me/{username}?start=<КОД> (только магазин)\n\n"
-        f"Текущий магазин: {store_line}. Роль: *{prof['role']}*.\n"
+        f"Текущий магазин: {store_line}. Роль: *{_role_for_display(u.id, prof)}*.\n"
         "Список кодов: /stores",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown",
@@ -549,7 +553,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     prof = get_profile(u.id)
-    if prof["role"] != "auditor":
+    # админ тоже может проходить чек-лист
+    if not (prof["role"] == "auditor" or is_admin(u.id)):
         await update.effective_chat.send_message("Твоя роль — viewer. Для прохождения чек-листа нужна роль auditor.")
         return
     err = must_have_store(update, prof)
@@ -570,7 +575,8 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = q.from_user
     prof = get_profile(u.id)
 
-    if prof["role"] != "auditor":
+    # админ тоже может
+    if not (prof["role"] == "auditor" or is_admin(u.id)):
         await q.answer("Недостаточно прав", show_alert=True)
         return
     err = must_have_store(update, prof)
@@ -777,5 +783,7 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
+
 
 
