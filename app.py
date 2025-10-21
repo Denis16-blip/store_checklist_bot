@@ -123,54 +123,82 @@ CHECKLIST = [
     },
 ]
 
-# подготовим плоский индекс для прохождения
-_FLAT_ITEMS = []
-for si, section in enumerate(CHECKLIST):
-    for ii, item in enumerate(section["items"]):
-        _FLAT_ITEMS.append((si, ii))
-
-TOTAL_STEPS = len(_FLAT_ITEMS)
-
-# состояние по чатам: {chat_id: {"idx": int, "done": set[(si,ii)]}}
+# ──────────────────────────────────────────────────────────────────────────────
+# Состояние чек-листа (поквартально/секциями)
+# ──────────────────────────────────────────────────────────────────────────────
+# Для каждого чата храним:
+# sec — индекс текущего раздела
+# marks — словарь {секция: {item_index: True/False/None}}
+# None = не отмечено, True = выполнено, False = не выполнено
 _cl_state = {}
 
 def _cl_get(chat_id: int):
     st = _cl_state.get(chat_id)
     if not st:
-        st = {"idx": 0, "done": set()}
+        st = {"sec": 0, "marks": {}}
         _cl_state[chat_id] = st
     return st
 
-def _fmt_step(si: int, ii: int) -> str:
-    title = CHECKLIST[si]["title"]
-    text = CHECKLIST[si]["items"][ii]
-    # человеко-читаемая нумерация
-    k = _FLAT_ITEMS.index((si, ii)) + 1
-    return f"*{title}*\n\n• {text}\n\nПрогресс: *{k}/{TOTAL_STEPS}*"
+def _human_sec_progress(st) -> tuple[int, int]:
+    done = 0
+    total = 0
+    for si, sec in enumerate(CHECKLIST):
+        total += len(sec["items"])
+        sec_marks = st["marks"].get(si, {})
+        for ii in range(len(sec["items"])):
+            v = sec_marks.get(ii, None)
+            if v is True:
+                done += 1
+    return done, total
 
-def _fmt_progress(done: set) -> str:
-    cnt = len(done)
-    pct = int(round(100 * cnt / TOTAL_STEPS)) if TOTAL_STEPS else 0
-    # короткий отчёт по разделам
-    lines = [f"Готово: *{cnt}/{TOTAL_STEPS}* ({pct}%)"]
-    for si, section in enumerate(CHECKLIST):
-        total = len(section["items"])
-        done_i = sum((si, ii) in done for ii in range(total))
-        tick = "✅" if done_i == total else ("➖" if done_i else "⬜️")
-        lines.append(f"{tick} {section['title']} — {done_i}/{total}")
+def _fmt_section_text(si: int, st) -> str:
+    sec = CHECKLIST[si]
+    sec_marks = st["marks"].get(si, {})
+    lines = [f"*{sec['title']}*"]
+    for ii, text in enumerate(sec["items"]):
+        mark = sec_marks.get(ii, None)
+        sym = "✅" if mark is True else ("❌" if mark is False else "⬜️")
+        lines.append(f"{ii+1}. {sym} {text}")
+    done, total = _human_sec_progress(st)
+    pct = int(round(100 * done / total)) if total else 0
+    lines.append("")
+    lines.append(f"Прогресс: *{done}/{total}* ({pct}%)")
+    lines.append("_Нажимай на кнопки с номерами, чтобы переключать ⬜️→✅→❌._")
     return "\n".join(lines)
 
-def _kb_main():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✔ Выполнено", callback_data="cl:done"),
-            InlineKeyboardButton("➡ Пропустить", callback_data="cl:skip"),
-        ],
-        [
-            InlineKeyboardButton("📋 Прогресс", callback_data="cl:progress"),
-            InlineKeyboardButton("🔁 Сброс", callback_data="cl:reset"),
-        ],
+def _kb_section(si: int, st):
+    sec = CHECKLIST[si]
+    sec_marks = st["marks"].get(si, {})
+    rows = []
+    # Кнопка на каждый пункт: номер + текущий символ
+    for ii in range(len(sec["items"])):
+        v = sec_marks.get(ii, None)
+        sym = "✅" if v is True else ("❌" if v is False else "⬜️")
+        label = f"{ii+1} {sym}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"cl:toggle:{ii}")])
+
+    # Управление секцией
+    controls = [
+        InlineKeyboardButton("➡ Далее", callback_data="cl:next"),
+        InlineKeyboardButton("↩ Пропустить секцию", callback_data="cl:skip"),
+    ]
+    rows.append(controls)
+    rows.append([
+        InlineKeyboardButton("♻️ Сброс секции", callback_data="cl:resetsec"),
+        InlineKeyboardButton("📋 Прогресс", callback_data="cl:progress"),
     ])
+    return InlineKeyboardMarkup(rows)
+
+def _fmt_progress_text(st) -> str:
+    done, total = _human_sec_progress(st)
+    pct = int(round(100 * done / total)) if total else 0
+    lines = [f"Готово: *{done}/{total}* ({pct}%)"]
+    for si, sec in enumerate(CHECKLIST):
+        sec_total = len(sec["items"])
+        sec_done = sum(1 for ii in range(sec_total) if st["marks"].get(si, {}).get(ii) is True)
+        tick = "✅" if sec_done == sec_total and sec_total > 0 else ("➖" if sec_done else "⬜️")
+        lines.append(f"{tick} {sec['title']} — {sec_done}/{sec_total}")
+    return "\n".join(lines)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Бизнес-логика бота
@@ -181,7 +209,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("Чек-лист", callback_data="cl:start"),
     ]]
     await update.effective_chat.send_message(
-        "Привет! Бот на вебхуке жив. Нажми кнопку или пришли /start ещё раз.",
+        "Привет! Нажми «Чек-лист», чтобы пройти блоками.",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
@@ -193,19 +221,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("pong")
         await q.edit_message_text("Кнопка работает ✅")
         return
-    # обработка чек-листа
     if q.data.startswith("cl:"):
         await cl_callback(update, context)
         return
 
-# ───────────── Чек-лист: команды/коллбеки ─────────────
+# ───────────── Чек-лист блочно ─────────────
 async def cmd_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     st = _cl_get(chat_id)
-    si, ii = _FLAT_ITEMS[st["idx"]]
+    si = st["sec"]
     await update.effective_chat.send_message(
-        _fmt_step(si, ii),
-        reply_markup=_kb_main(),
+        _fmt_section_text(si, st),
+        reply_markup=_kb_section(si, st),
         parse_mode="Markdown",
     )
 
@@ -214,52 +241,73 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = q.message.chat_id
     st = _cl_get(chat_id)
 
-    action = q.data.split(":", 1)[1]
+    action = q.data.split(":", 1)[1]  # всё после "cl:"
+    si = st["sec"]
+
     if action == "start":
-        st["idx"] = 0
-        st["done"] = set()
-        si, ii = _FLAT_ITEMS[st["idx"]]
+        st["sec"] = 0
+        st["marks"] = {}
+        si = 0
         await q.answer("Поехали!")
         await q.edit_message_text(
-            _fmt_step(si, ii),
-            reply_markup=_kb_main(),
+            _fmt_section_text(si, st),
+            reply_markup=_kb_section(si, st),
             parse_mode="Markdown",
         )
         return
 
-    if action == "done":
-        si, ii = _FLAT_ITEMS[st["idx"]]
-        st["done"].add((si, ii))
-        # падение к следующему пункту
-        st["idx"] = min(st["idx"] + 1, TOTAL_STEPS - 1)
-
-    elif action == "skip":
-        st["idx"] = min(st["idx"] + 1, TOTAL_STEPS - 1)
-
-    elif action == "reset":
-        st["idx"] = 0
-        st["done"] = set()
-        await q.answer("Сброшено.")
-    elif action == "progress":
-        await q.answer("Прогресс")
-        text = _fmt_progress(st["done"])
+    if action.startswith("toggle:"):
+        # переключаем состояние конкретного пункта секции: None -> True -> False -> None
+        ii = int(action.split(":")[1])
+        sec_marks = st["marks"].setdefault(si, {})
+        cur = sec_marks.get(ii, None)
+        nxt = True if cur is None else (False if cur is True else None)
+        sec_marks[ii] = nxt
+        await q.answer("Обновлено")
         await q.edit_message_text(
-            text + "\n\nНажми «➡ Пропустить» или «✔ Выполнено», чтобы продолжить.",
-            reply_markup=_kb_main(),
+            _fmt_section_text(si, st),
+            reply_markup=_kb_section(si, st),
             parse_mode="Markdown",
         )
         return
 
-    # проверяем, не закрыли ли всё
-    if len(st["done"]) == TOTAL_STEPS:
-        text = "🎉 Чек-лист завершён!\n\n" + _fmt_progress(st["done"])
-        await q.edit_message_text(text, parse_mode="Markdown")
+    if action == "resetsec":
+        st["marks"][si] = {}
+        await q.answer("Секция сброшена")
+        await q.edit_message_text(
+            _fmt_section_text(si, st),
+            reply_markup=_kb_section(si, st),
+            parse_mode="Markdown",
+        )
         return
 
-    si, ii = _FLAT_ITEMS[st["idx"]]
+    if action == "progress":
+        await q.answer("Прогресс")
+        await q.edit_message_text(
+            _fmt_progress_text(st) + "\n\nНажми «➡ Далее», чтобы продолжить.",
+            reply_markup=_kb_section(si, st),
+            parse_mode="Markdown",
+        )
+        return
+
+    if action == "skip":
+        st["sec"] = min(st["sec"] + 1, len(CHECKLIST) - 1)
+        si = st["sec"]
+
+    if action == "next":
+        # Переходим к следующей секции
+        if si >= len(CHECKLIST) - 1:
+            # конец чек-листа
+            text = "🎉 Чек-лист завершён!\n\n" + _fmt_progress_text(st)
+            await q.edit_message_text(text, parse_mode="Markdown")
+            return
+        st["sec"] += 1
+        si = st["sec"]
+
+    # показать текущую/новую секцию
     await q.edit_message_text(
-        _fmt_step(si, ii),
-        reply_markup=_kb_main(),
+        _fmt_section_text(si, st),
+        reply_markup=_kb_section(si, st),
         parse_mode="Markdown",
     )
 
@@ -268,7 +316,6 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("start", cmd_start))
     app_.add_handler(CommandHandler("checklist", cmd_checklist))
     app_.add_handler(CallbackQueryHandler(on_button))
-    # отдельный хендлер на всякий случай, если прилетят cl:* напрямую
     app_.add_handler(CallbackQueryHandler(cl_callback, pattern=r"^cl:"))
     return app_
 
@@ -294,7 +341,6 @@ def _ptb_thread_main():
     log("PTB thread: loop created, initializing…")
     try:
         _loop.run_until_complete(_ptb_init_async())
-        # дальше loop просто живёт; никаких polling/start() нам не нужно
         _loop.run_forever()
     except Exception as e:
         log(f"PTB thread ERROR: {e}")
@@ -323,13 +369,16 @@ def loop_state():
 
 @app.route("/diag")
 def diag():
+    # покажем суммарные шаги для справки
+    total = sum(len(s["items"]) for s in CHECKLIST)
     info = {
         "loop_alive": _loop_alive,
         "loop_is_running": bool(_loop and _loop.is_running()),
         "ptb_ready": _ptb_ready,
         "has_application": _app is not None,
         "now": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "checklist_total_steps": TOTAL_STEPS,
+        "checklist_total_items": total,
+        "sections": len(CHECKLIST),
     }
     return app.response_class(json.dumps(info, ensure_ascii=False, indent=2), mimetype="application/json")
 
@@ -362,7 +411,6 @@ def set_webhook():
 def telegram_webhook():
     """Телега шлёт JSON сюда. Гоним апдейт в PTB через loop из фонового потока."""
     if not (_loop_alive and _ptb_ready and _app and _loop):
-        # Телега сама ретраит; отдаём 503, пока PTB не готов.
         log("webhook → loop not ready (503)")
         return Response("loop not ready", status=503)
 
@@ -381,11 +429,10 @@ def telegram_webhook():
 # ──────────────────────────────────────────────────────────────────────────────
 @app.before_request
 def _before_any():
-    # гарантируем запуск фонового потока как только приходит первый запрос
     ensure_ptb_started()
 
 if __name__ == "__main__":
-    # локальный запуск
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
 
