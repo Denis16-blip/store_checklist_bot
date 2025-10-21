@@ -13,6 +13,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
     MessageHandler, filters,
 )
+from telegram.error import BadRequest  # ← добавлено
 
 import httpx  # для прямых вызовов Telegram API (диагностика)
 
@@ -224,6 +225,26 @@ def _fmt_progress_text(st) -> str:
     return "\n".join(lines)
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Безопасное редактирование сообщения (игнорируем 'Message is not modified')
+# ──────────────────────────────────────────────────────────────────────────────
+async def _safe_edit(q, text: str, reply_markup=None, parse_mode: str | None = "Markdown"):
+    try:
+        await q.edit_message_text(
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+    except BadRequest as e:
+        # Это нормально: пользователь нажал кнопку, не меняющую контент/клавиатуру
+        if "Message is not modified" in str(e):
+            try:
+                await q.answer("Без изменений")
+            except Exception:
+                pass
+            return
+        raise
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Бизнес-логика бота
 # ──────────────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -242,7 +263,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if q.data == "ping":
         await q.answer("pong")
-        await q.edit_message_text("Кнопка работает ✅")
+        # здесь контент меняется — оставим обычное редактирование
+        try:
+            await q.edit_message_text("Кнопка работает ✅")
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                await q.answer("Без изменений")
+            else:
+                raise
         return
     if q.data.startswith("cl:"):
         await cl_callback(update, context)
@@ -272,10 +300,10 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["marks"] = {}
         si = 0
         await q.answer("Поехали!")
-        await q.edit_message_text(
+        await _safe_edit(
+            q,
             _fmt_section_text(si, st),
             reply_markup=_kb_section(si, st),
-            parse_mode="Markdown",
         )
         return
 
@@ -305,29 +333,29 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nxt = True if cur is None else (False if cur is True else None)
         sec_marks[ii] = nxt
         await q.answer("Обновлено")
-        await q.edit_message_text(
+        await _safe_edit(
+            q,
             _fmt_section_text(si, st),
             reply_markup=_kb_section(si, st),
-            parse_mode="Markdown",
         )
         return
 
     if action == "resetsec":
         st["marks"][si] = {}
         await q.answer("Секция сброшена")
-        await q.edit_message_text(
+        await _safe_edit(
+            q,
             _fmt_section_text(si, st),
             reply_markup=_kb_section(si, st),
-            parse_mode="Markdown",
         )
         return
 
     if action == "progress":
         await q.answer("Прогресс")
-        await q.edit_message_text(
+        await _safe_edit(
+            q,
             _fmt_progress_text(st) + "\n\nНажми «➡ Далее», чтобы продолжить.",
             reply_markup=_kb_section(si, st),
-            parse_mode="Markdown",
         )
         return
 
@@ -340,16 +368,16 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if si >= len(CHECKLIST) - 1:
             # конец чек-листа
             text = "🎉 Чек-лист завершён!\n\n" + _fmt_progress_text(st)
-            await q.edit_message_text(text, parse_mode="Markdown")
+            await _safe_edit(q, text)
             return
         st["sec"] += 1
         si = st["sec"]
 
     # показать текущую/новую секцию
-    await q.edit_message_text(
+    await _safe_edit(
+        q,
         _fmt_section_text(si, st),
         reply_markup=_kb_section(si, st),
-        parse_mode="Markdown",
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -485,6 +513,7 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
 
 
 
