@@ -13,7 +13,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
     MessageHandler, filters,
 )
-from telegram.error import BadRequest  # ← добавлено
+from telegram.error import BadRequest  # ← для безопасного edit
 
 import httpx  # для прямых вызовов Telegram API (диагностика)
 
@@ -41,9 +41,81 @@ def log(msg: str):
     print(f"[{datetime.utcnow().isoformat(timespec='seconds')}Z] {msg}", flush=True)
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ШАГ 1. МАГАЗИНЫ + РОЛИ (минимум)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Каталог магазинов: код -> человекочитаемое имя
+STORE_CATALOG: dict[str, str] = {
+    "C0TQ": "RU_MOSCOW_VegasKuncevo_SPORT",
+    "C0SL": "RU_MOSCOW_Afimall_SPORT",
+    "C022": "RU_MOSCOW_OkhotnyRyad_URBAN",
+    "C0VU": "RU_MOSCOW_Metropolis_SPORT",
+    "C0OI": "RU_MOSCOW_Kolumbus_SPORT",
+    "C0GN": "RU_MOSCOW_MegaBelayaDacha_SPORT",
+    "C0GJ": "RU_MOSCOW_MegaBelayaDacha_URBAN",
+    "C047": "RU_MOSCOW_Vegas_SPORT",
+    "C0VT": "RU_MOSCOW_Evropolis_SPORT",
+    "C0TY": "RU_MOSCOW_KashirskayaPlaza_SPORT",
+    "C0IZ": "RU_MYTISHCHI_MytishchiKrasnykit_SPORT",
+    "C0DY": "RU_OBNINSK_TriumfPlaza_SPORT",
+    "C0SM": "RU_TULA_Maksi_SPORT",
+    "C09Z": "RU_KALUGA_RIO_SPORT",
+    "C0NJ": "RU_MOSCOW_VegasSiti_SPORT",
+    "C03F": "RU_IZHEVSK_Pushkinskaya_SPORT",
+    "C0KH": "RU_YAROSLAVL_Aura_SPORT",
+    "C0RG": "RU_ARKHANGELSK_TitanArena_SPORT",
+    "C0OQ": "RU_SAINT-PETERSBURG_Leto_SPORT",
+    "C08E": "RU_SAINT-PETERSBURG_Galereya_SPORT",
+    "C0WF": "RU_PERM_Planeta_SPORT",
+    "C0VB": "RU_OMSK_Mega_SPORT",
+    "C00X": "RU_ABAKAN_Ametist_SPORT",
+    "C0JP": "RU_IRKUTSK_ModnyKvartal_SPORT",
+    "C00K": "RU_NOVOSIBIRSK_TTSAura_SPORT",
+    "C0EI": "RU_SURGUT_Aura_SPORT",
+    "C002": "RU_YUZHNO-SAKHALINSK_SitiMoll_SPORT",
+    "C082": "RU_GELENDZHIK_Lenina_SPORT",
+    "C0JN": "RU_KRASNODAR_Galereya_SPORT",
+    "C0BW": "RU_KRASNODAR_OzMoll_SPORT",
+    "C0VN": "RU_NOVOROSSIYSK_KrasnayaPloshchad_SPORT",
+    "C081": "RU_SARATOV_TriumfMoll_SPORT",
+    "C0WE": "RU_SOCHI_MoreMoll_SPORT",
+    "C085": "RU_VORONEZH_GalereyaChizhova_SPORT",
+    "C0WD": "RU_MOSCOW_PaveletskayaPlaza_SPORT",
+    "C0VY": "RU_MOSCOW_KM7_SPORT",
+    "C0LU": "RU_MOSCOW_Aviapark_SPORT",
+    "C024": "RU_MOSCOW_KrasnayaPresnya_SPORT",
+    "C25Q": "RU_MOSCOW_Salaris_Sport",
+}
+
+# Роли: auditor – заполняет чек-лист; viewer – только смотрит/получает отчёты
+# Простейший in-memory реестр пользователей.
+STAFF: dict[int, dict] = {
+    # пример предзаписи для администратора:
+    # ADMIN_ID: {"role": "auditor", "stores": list(STORE_CATALOG.keys()), "current_store": None}
+}
+
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID and user_id == ADMIN_ID
+
+def get_profile(user_id: int) -> dict:
+    prof = STAFF.get(user_id)
+    if not prof:
+        prof = {"role": "viewer", "stores": [], "current_store": None}
+        STAFF[user_id] = prof
+    return prof
+
+def must_have_store(update: Update, prof: dict) -> str | None:
+    """Вернёт текст ошибки, если магазин не выбран/не разрешён."""
+    if not prof.get("current_store"):
+        return "Сначала выбери магазин: /stores → /setstore <КОД>"
+    cur = prof["current_store"]
+    if prof["stores"] and cur not in prof["stores"]:
+        return "Текущий магазин не входит в твой список. Выбери другой: /setstore <КОД>"
+    return None
+
+# ──────────────────────────────────────────────────────────────────────────────
 # ДАННЫЕ ЧЕК-ЛИСТА (из PPTX)
 # ──────────────────────────────────────────────────────────────────────────────
-# Структура: список разделов, в разделе: заголовок и список пунктов.
 CHECKLIST = [
     {
         "title": "1. ОБЩЕЕ РАЗМЕЩЕНИЕ АССОРТИМЕНТА",
@@ -127,28 +199,22 @@ CHECKLIST = [
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Примеры-фото для разделов (зашитые file_id)
-# Индексация соответствует CHECKLIST:
 # 0 — Общее размещение, 1 — Кросс-мерч, 2 — Наполненность, 3 — Манекены,
-# 4 — Витрина, 5 — Чистая касса, 6 — Освещение.
+# 4 — Витрина (пока нет), 5 — Чистая касса, 6 — Освещение.
 # ──────────────────────────────────────────────────────────────────────────────
 EXAMPLE_PHOTOS: dict[int, list[str]] = {
-    0: ["AgACAgIAAxkBAAN-aPc9fUdYqxNInDdLrh01UHckFW0AApL-MRvGH7hLzIOseULYaQ0BAAMCAAN4AAM2BA"],  # Общее размещение
-    1: ["AgACAgIAAxkBAAN7aPc9WeexQm229VrzIW07tL18TccAAo3-MRvGH7hLuY3p8Zmreq8BAAMCAAN4AAM2BA"],  # Кросс-мерч/стайлинг
-    2: ["AgACAgIAAxkBAAN9aPc9dabPgwhMuqDyMuCP52xNiZoAApH-MRvGH7hLayPbIRcX4O0BAAMCAAN4AAM2BA"],  # Наполненность/пополнение
-    3: ["AgACAgIAAxkBAAN8aPc9bcea5a-h24wkS-zxpUBbdH4AApD-MRvGH7hLc0mtlweQiY4BAAMCAAN4AAM2BA"],  # Манекены
-    # 4 (Витрина) — пока без примера, можно добавить позже
-    5: ["AgACAgIAAxkBAAOAaPc9jBeS7KupdZWKttfeHrjT0YAAApT-MRvGH7hLYmedyzrqAAHaAQADAgADeAADNgQ"],  # Чистая кассовая зона
-    6: ["AgACAgIAAxkBAAN_aPc9hXcYmK--YdH5wyJGthZp7kIAApP-MRvGH7hLalo9O7bUB34BAAMCAAN4AAM2BA"],  # Освещение
+    0: ["AgACAgIAAxkBAAN-aPc9fUdYqxNInDdLrh01UHckFW0AApL-MRvGH7hLzIOseULYaQ0BAAMCAAN4AAM2BA"],
+    1: ["AgACAgIAAxkBAAN7aPc9WeexQm229VrzIW07tL18TccAAo3-MRvGH7hLuY3p8Zmreq8BAAMCAAN4AAM2BA"],
+    2: ["AgACAgIAAxkBAAN9aPc9dabPgwhMuqDyMuCP52xNiZoAApH-MRvGH7hLayPbIRcX4O0BAAMCAAN4AAM2BA"],
+    3: ["AgACAgIAAxkBAAN8aPc9bcea5a-h24wkS-zxpUBbdH4AApD-MRvGH7hLc0mtlweQiY4BAAMCAAN4AAM2BA"],
+    5: ["AgACAgIAAxkBAAOAaPc9jBeS7KupdZWKttfeHrjT0YAAApT-MRvGH7hLYmedyzrqAAHaAQADAgADeAADNgQ"],
+    6: ["AgACAgIAAxkBAAN_aPc9hXcYmK--YdH5wyJGthZp7kIAApP-MRvGH7hLalo9O7bUB34BAAMCAAN4AAM2BA"],
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Состояние чек-листа (поквартально/секциями)
+# Состояние чек-листа
 # ──────────────────────────────────────────────────────────────────────────────
-# Для каждого чата храним:
-# sec — индекс текущего раздела
-# marks — словарь {секция: {item_index: True/False/None}}
-# None = не отмечено, True = выполнено, False = не выполнено
-_cl_state = {}
+_cl_state = {}  # chat_id -> {"sec": int, "marks": {sec: {item_index: bool|None}}}
 
 def _cl_get(chat_id: int):
     st = _cl_state.get(chat_id)
@@ -188,29 +254,24 @@ def _kb_section(si: int, st):
     sec = CHECKLIST[si]
     sec_marks = st["marks"].get(si, {})
     rows = []
-    # Кнопка на каждый пункт: номер + текущий символ
     for ii in range(len(sec["items"])):
         v = sec_marks.get(ii, None)
         sym = "✅" if v is True else ("❌" if v is False else "⬜️")
         label = f"{ii+1} {sym}"
         rows.append([InlineKeyboardButton(label, callback_data=f"cl:toggle:{ii}")])
 
-    # Управление секцией
     controls = [
         InlineKeyboardButton("➡ Далее", callback_data="cl:next"),
         InlineKeyboardButton("↩ Пропустить секцию", callback_data="cl:skip"),
     ]
     rows.append(controls)
 
-    # Доп. действия
     extras = [InlineKeyboardButton("📋 Прогресс", callback_data="cl:progress")]
     if si in EXAMPLE_PHOTOS:
         extras.insert(0, InlineKeyboardButton("📷 Пример", callback_data="cl:photo"))
     rows.append(extras)
 
-    # Сброс
     rows.append([InlineKeyboardButton("♻️ Сброс секции", callback_data="cl:resetsec")])
-
     return InlineKeyboardMarkup(rows)
 
 def _fmt_progress_text(st) -> str:
@@ -229,13 +290,8 @@ def _fmt_progress_text(st) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 async def _safe_edit(q, text: str, reply_markup=None, parse_mode: str | None = "Markdown"):
     try:
-        await q.edit_message_text(
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode,
-        )
+        await q.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
     except BadRequest as e:
-        # Это нормально: пользователь нажал кнопку, не меняющую контент/клавиатуру
         if "Message is not modified" in str(e):
             try:
                 await q.answer("Без изменений")
@@ -243,6 +299,70 @@ async def _safe_edit(q, text: str, reply_markup=None, parse_mode: str | None = "
                 pass
             return
         raise
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Команды: роли и магазины
+# ──────────────────────────────────────────────────────────────────────────────
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    prof = get_profile(u.id)
+    cur = prof.get("current_store")
+    cur_name = STORE_CATALOG.get(cur, "—") if cur else "—"
+    await update.effective_chat.send_message(
+        f"🧾 Профиль\n"
+        f"ID: `{u.id}`\n"
+        f"Роль: *{prof['role']}*\n"
+        f"Магазин: *{cur or '—'}* — {cur_name}\n"
+        f"Доступные магазины: {', '.join(prof['stores']) if prof['stores'] else 'не ограничено'}",
+        parse_mode="Markdown",
+    )
+
+async def cmd_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["*Коды магазинов:*"]
+    for code, name in sorted(STORE_CATALOG.items()):
+        lines.append(f"`{code}` — {name}")
+    await update.effective_chat.send_message("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_setstore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    prof = get_profile(u.id)
+    if not context.args:
+        await update.effective_chat.send_message("Используй: /setstore <КОД> (см. /stores)")
+        return
+    code = context.args[0].strip().upper()
+    if code not in STORE_CATALOG:
+        await update.effective_chat.send_message("Неизвестный код магазина. Список: /stores")
+        return
+    # если список магазинов ограничен, проверим доступ
+    if prof["stores"] and code not in prof["stores"]:
+        await update.effective_chat.send_message("Этот магазин тебе не назначен. Обратись к администратору.")
+        return
+    prof["current_store"] = code
+    await update.effective_chat.send_message(f"Ок! Текущий магазин: *{code}* — {STORE_CATALOG[code]}", parse_mode="Markdown")
+
+async def cmd_setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_admin(u.id):
+        await update.effective_chat.send_message("Команда только для администратора.")
+        return
+    if not context.args:
+        await update.effective_chat.send_message("Используй: /setrole <auditor|viewer> [@username|user_id]")
+        return
+    role = context.args[0].lower()
+    if role not in ("auditor", "viewer"):
+        await update.effective_chat.send_message("Роль должна быть auditor или viewer.")
+        return
+    target_id = u.id
+    if len(context.args) >= 2:
+        # простая попытка распарсить user_id
+        try:
+            target_id = int(context.args[1].replace("@", ""))
+        except Exception:
+            await update.effective_chat.send_message("Укажи numeric user_id (пока без @username).")
+            return
+    prof = get_profile(target_id)
+    prof["role"] = role
+    await update.effective_chat.send_message(f"Роль пользователя {target_id} установлена: *{role}*", parse_mode="Markdown")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Бизнес-логика бота
@@ -253,8 +373,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("Чек-лист", callback_data="cl:start"),
     ]]
     await update.effective_chat.send_message(
-        "Привет! Нажми «Чек-лист», чтобы пройти блоками.",
+        "Привет! Выбери магазин командой /setstore <КОД> (список: /stores). "
+        "Админ выдаёт роль `/setrole auditor <user_id>`.\nЗатем жми «Чек-лист».",
         reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown",
     )
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -263,7 +385,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if q.data == "ping":
         await q.answer("pong")
-        # здесь контент меняется — оставим обычное редактирование
         try:
             await q.edit_message_text("Кнопка работает ✅")
         except BadRequest as e:
@@ -278,6 +399,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ───────────── Чек-лист блочно ─────────────
 async def cmd_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ручной вход (если кто-то вызовет /checklist)
+    u = update.effective_user
+    prof = get_profile(u.id)
+    if prof["role"] != "auditor":
+        await update.effective_chat.send_message("Твоя роль — viewer. Для прохождения чек-листа нужна роль auditor.")
+        return
+    err = must_have_store(update, prof)
+    if err:
+        await update.effective_chat.send_message(err)
+        return
+
     chat_id = update.effective_chat.id
     st = _cl_get(chat_id)
     si = st["sec"]
@@ -289,6 +421,18 @@ async def cmd_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    u = q.from_user
+    prof = get_profile(u.id)
+
+    # доступ к чек-листу только для auditor и с выбранным магазином
+    if prof["role"] != "auditor":
+        await q.answer("Недостаточно прав", show_alert=True)
+        return
+    err = must_have_store(update, prof)
+    if err:
+        await q.answer(err, show_alert=True)
+        return
+
     chat_id = q.message.chat_id
     st = _cl_get(chat_id)
 
@@ -299,16 +443,11 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["sec"] = 0
         st["marks"] = {}
         si = 0
-        await q.answer("Поехали!")
-        await _safe_edit(
-            q,
-            _fmt_section_text(si, st),
-            reply_markup=_kb_section(si, st),
-        )
+        await q.answer(f"Поехали! Магазин: {prof.get('current_store')}")
+        await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st))
         return
 
     if action == "photo":
-        # отправим пример, если он есть
         files = EXAMPLE_PHOTOS.get(si)
         if files:
             try:
@@ -326,37 +465,25 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action.startswith("toggle:"):
-        # переключаем состояние конкретного пункта секции: None -> True -> False -> None
         ii = int(action.split(":")[1])
         sec_marks = st["marks"].setdefault(si, {})
         cur = sec_marks.get(ii, None)
         nxt = True if cur is None else (False if cur is True else None)
         sec_marks[ii] = nxt
         await q.answer("Обновлено")
-        await _safe_edit(
-            q,
-            _fmt_section_text(si, st),
-            reply_markup=_kb_section(si, st),
-        )
+        await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st))
         return
 
     if action == "resetsec":
         st["marks"][si] = {}
         await q.answer("Секция сброшена")
-        await _safe_edit(
-            q,
-            _fmt_section_text(si, st),
-            reply_markup=_kb_section(si, st),
-        )
+        await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st))
         return
 
     if action == "progress":
         await q.answer("Прогресс")
-        await _safe_edit(
-            q,
-            _fmt_progress_text(st) + "\n\nНажми «➡ Далее», чтобы продолжить.",
-            reply_markup=_kb_section(si, st),
-        )
+        await _safe_edit(q, _fmt_progress_text(st) + "\n\nНажми «➡ Далее», чтобы продолжить.",
+                         reply_markup=_kb_section(si, st))
         return
 
     if action == "skip":
@@ -364,21 +491,14 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         si = st["sec"]
 
     if action == "next":
-        # Переходим к следующей секции
         if si >= len(CHECKLIST) - 1:
-            # конец чек-листа
             text = "🎉 Чек-лист завершён!\n\n" + _fmt_progress_text(st)
             await _safe_edit(q, text)
             return
         st["sec"] += 1
         si = st["sec"]
 
-    # показать текущую/новую секцию
-    await _safe_edit(
-        q,
-        _fmt_section_text(si, st),
-        reply_markup=_kb_section(si, st),
-    )
+    await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Регистрация хэндлеров
@@ -389,12 +509,14 @@ def build_application() -> Application:
     # Команды
     app_.add_handler(CommandHandler("start", cmd_start))
     app_.add_handler(CommandHandler("checklist", cmd_checklist))
+    app_.add_handler(CommandHandler("whoami", cmd_whoami))
+    app_.add_handler(CommandHandler("stores", cmd_stores))
+    app_.add_handler(CommandHandler("setstore", cmd_setstore))
+    app_.add_handler(CommandHandler("setrole", cmd_setrole))
 
     # Кнопки
     app_.add_handler(CallbackQueryHandler(on_button))
     app_.add_handler(CallbackQueryHandler(cl_callback, pattern=r"^cl:"))
-
-    # (Фото-хэндлер и команды сбора file_id удалены — больше не нужны)
 
     return app_
 
@@ -407,7 +529,7 @@ async def _ptb_init_async():
     log("PTB: build application…")
     _app = build_application()
     log("PTB: application.initialize()…")
-    await _app.initialize()       # регистрирует хэндлеры, готовит bot/session
+    await _app.initialize()
     _ptb_ready = True
     log("PTB: READY")
 
@@ -448,7 +570,6 @@ def loop_state():
 
 @app.route("/diag")
 def diag():
-    # покажем суммарные шаги для справки
     total = sum(len(s["items"]) for s in CHECKLIST)
     info = {
         "loop_alive": _loop_alive,
@@ -458,12 +579,13 @@ def diag():
         "now": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "checklist_total_items": total,
         "sections": len(CHECKLIST),
+        "stores": len(STORE_CATALOG),
+        "staff_records": len(STAFF),
     }
     return app.response_class(json.dumps(info, ensure_ascii=False, indent=2), mimetype="application/json")
 
 @app.route("/getwebhookinfo_raw")
 def getwebhookinfo_raw():
-    """Прямой вызов Telegram API без PTB/loop — для диагностики."""
     try:
         r = httpx.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo", timeout=10)
         return app.response_class(r.text, mimetype="application/json", status=r.status_code)
@@ -472,7 +594,6 @@ def getwebhookinfo_raw():
 
 @app.route("/set-webhook")
 def set_webhook():
-    """Удобно дергать из браузера после деплоя."""
     target = BASE_URL.rstrip("/") + "/"
     try:
         r = httpx.get(
@@ -488,7 +609,6 @@ def set_webhook():
 
 @app.post("/")
 def telegram_webhook():
-    """Телега шлёт JSON сюда. Гоним апдейт в PTB через loop из фонового потока."""
     if not (_loop_alive and _ptb_ready and _app and _loop):
         log("webhook → loop not ready (503)")
         return Response("loop not ready", status=503)
@@ -513,7 +633,4 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
-
-
-
 
