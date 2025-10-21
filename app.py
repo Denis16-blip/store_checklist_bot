@@ -10,7 +10,8 @@ from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+    MessageHandler, filters,   # ← ДОБАВЛЕНО
 )
 
 import httpx  # для прямых вызовов Telegram API (диагностика)
@@ -311,12 +312,101 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 🔎 РЕЖИМ СБОРА file_id ДЛЯ ФОТО (АДМИН)
+# ──────────────────────────────────────────────────────────────────────────────
+# Для каждого чата можно включить режим сбора,
+# чтобы админ мог накидать до N фото и получить их file_id.
+_photo_collect_state: dict[int, dict] = {}  # chat_id -> {"active": bool, "target": int, "ids": []}
+
+def _is_admin(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and ADMIN_ID and user.id == ADMIN_ID)
+
+async def cmd_photo_ids_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    chat_id = update.effective_chat.id
+    target = 6  # собираем 6 фото
+    _photo_collect_state[chat_id] = {"active": True, "target": target, "ids": []}
+    await update.effective_chat.send_message(
+        f"Режим сбора file_id включён. Пришлите {target} фото (по одному). Я верну file_id каждого. "
+        f"Команды: /photo_ids_status, /photo_ids_stop"
+    )
+
+async def cmd_photo_ids_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    chat_id = update.effective_chat.id
+    st = _photo_collect_state.get(chat_id)
+    if not st or not st.get("active"):
+        await update.effective_chat.send_message("Режим сбора уже выключен.")
+        return
+    st["active"] = False
+    await update.effective_chat.send_message("Режим сбора file_id выключен.")
+
+async def cmd_photo_ids_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return
+    chat_id = update.effective_chat.id
+    st = _photo_collect_state.get(chat_id, {"active": False, "ids": [], "target": 6})
+    await update.effective_chat.send_message(
+        f"Состояние: {'включён' if st.get('active') else 'выключен'} | "
+        f"Собрано: {len(st.get('ids', []))}/{st.get('target', 6)}\n"
+        f"IDs: {json.dumps(st.get('ids', []), ensure_ascii=False)}"
+    )
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Реагируем на фото только если режим сбора активен и отправитель — админ."""
+    if not _is_admin(update):
+        return
+    chat_id = update.effective_chat.id
+    st = _photo_collect_state.get(chat_id)
+    if not st or not st.get("active"):
+        return
+
+    msg = update.effective_message
+    if not msg or not msg.photo:
+        return
+
+    # Берём самое большое превью (последний элемент)
+    file_id = msg.photo[-1].file_id
+    st["ids"].append(file_id)
+    await update.effective_chat.send_message(f"✅ file_id сохранён:\n`{file_id}`", parse_mode="Markdown")
+
+    # Проверим, достигли ли лимита
+    if len(st["ids"]) >= st["target"]:
+        st["active"] = False
+        ids_json = json.dumps(st["ids"], ensure_ascii=False, indent=2)
+        await update.effective_chat.send_message(
+            "🎯 Собрано нужное количество фото. Режим отключён.\n"
+            "Список для копирования:\n"
+            f"```\n{ids_json}\n```",
+            parse_mode="Markdown",
+        )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Регистрация хэндлеров
+# ──────────────────────────────────────────────────────────────────────────────
 def build_application() -> Application:
     app_ = Application.builder().token(BOT_TOKEN).build()
+
+    # Команды
     app_.add_handler(CommandHandler("start", cmd_start))
     app_.add_handler(CommandHandler("checklist", cmd_checklist))
+
+    # Админ-команды для сбора file_id
+    app_.add_handler(CommandHandler("photo_ids_start", cmd_photo_ids_start))
+    app_.add_handler(CommandHandler("photo_ids_stop", cmd_photo_ids_stop))
+    app_.add_handler(CommandHandler("photo_ids_status", cmd_photo_ids_status))
+
+    # Кнопки
     app_.add_handler(CallbackQueryHandler(on_button))
     app_.add_handler(CallbackQueryHandler(cl_callback, pattern=r"^cl:"))
+
+    # Фото — в самом конце, чтобы не мешать остальному
+    app_.add_handler(MessageHandler(filters.PHOTO, on_photo))
+
     return app_
 
 # ──────────────────────────────────────────────────────────────────────────────
