@@ -157,7 +157,7 @@ ROLE_COMMANDS: dict[str, list[BotCommand]] = {
         BotCommand("stores", "список магазинов"),
         BotCommand("setstore", "выбрать магазин"),
         BotCommand("checklist", "чек-лист"),
-        BotCommand("viewer", "что может viewer"),
+        BotCommand("auditor", "что может auditor"),  # ← заменили viewer→auditor
     ],
     "admin": [
         BotCommand("start", "начать"),
@@ -168,7 +168,8 @@ ROLE_COMMANDS: dict[str, list[BotCommand]] = {
         BotCommand("checklist", "чек-лист"),
         BotCommand("pending", "заявки на модерацию"),
         BotCommand("setrole", "назначить роль"),
-        BotCommand("viewer", "что может viewer"),
+        BotCommand("bindings", "кто за что"),        # ← новая команда
+        BotCommand("admin", "что может admin"),
     ],
 }
 
@@ -362,8 +363,9 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if len(context.args) < 2:
         await update.effective_chat.send_message(
-            "Используй: /register <КОД_МАГАЗИНА> <СЕКРЕТ_РОЛИ>\n"
-            "Коды — /stores. Секрет выдаёт администратор."
+            "Используй: <code>/register &lt;КОД_МАГАЗИНА&gt; &lt;СЕКРЕТ_РОЛИ&gt;</code>\n"
+            "Коды — /stores. Секрет выдаёт администратор.",
+            parse_mode="HTML",
         )
         return
     store = context.args[0].strip().upper()
@@ -517,7 +519,7 @@ async def cmd_setstore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     prof = get_profile(u.id)
     if not context.args:
-        await update.effective_chat.send_message("Используй: /setstore <КОД> (см. /stores)")
+        await update.effective_chat.send_message("Используй: <code>/setstore &lt;КОД&gt;</code> (см. /stores)", parse_mode="HTML")
         return
     code = context.args[0].strip().upper()
     if code not in STORE_CATALOG:
@@ -536,12 +538,19 @@ async def cmd_setstore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /setrole <auditor|viewer> <user_id> [<STORE_CODE>]
+    Если указан STORE_CODE: назначаем current_store и додаём в список stores (если есть ограничения).
+    """
     u = update.effective_user
     if not is_admin(u.id):
         await update.effective_chat.send_message("Команда только для администратора.")
         return
     if len(context.args) < 2:
-        await update.effective_chat.send_message("Используй: /setrole <auditor|viewer> <user_id>")
+        await update.effective_chat.send_message(
+            "Используй: <code>/setrole &lt;auditor|viewer&gt; &lt;user_id&gt; [&lt;КОД_МАГАЗИНА&gt;]</code>",
+            parse_mode="HTML",
+        )
         return
     role = context.args[0].lower()
     try:
@@ -552,24 +561,89 @@ async def cmd_setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if role not in ("auditor", "viewer"):
         await update.effective_chat.send_message("Роль должна быть auditor или viewer.")
         return
+
     prof = get_profile(target)
     prof["role"] = role
+
+    # опционально выставим магазин
+    if len(context.args) >= 3:
+        store_code = context.args[2].strip().upper()
+        if store_code in STORE_CATALOG:
+            prof["current_store"] = store_code
+            # если у пользователя ограниченный список — добавим код
+            if prof["stores"] is not None:
+                if store_code not in prof["stores"]:
+                    prof["stores"].append(store_code)
+        else:
+            await update.effective_chat.send_message(f"Внимание: код магазина не найден: <b>{html.escape(store_code)}</b>", parse_mode="HTML")
+
     _save_staff()
-    await update.effective_chat.send_message(f"Роль пользователя {target} установлена: <b>{html.escape(role)}</b>", parse_mode="HTML")
+    await update.effective_chat.send_message(
+        f"Роль пользователя {target} установлена: <b>{html.escape(role)}</b>"
+        + (f"; магазин: <b>{html.escape(prof.get('current_store') or '—')}</b>" if len(context.args) >= 3 else ""),
+        parse_mode="HTML"
+    )
     # обновим меню команд для целевого пользователя (в его личном чате)
     await refresh_chat_commands(context.bot, target, target)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Роль viewer — краткая справка
+# Помощь по ролям
 # ──────────────────────────────────────────────────────────────────────────────
 async def cmd_viewer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "<b>Роль: Viewer</b>\n"
         "• Видит профиль и магазины: /whoami, /stores\n"
-        "• Может выбрать магазин для просмотра: /setstore <КОД>\n"
+        "• Может выбрать магазин для просмотра: <code>/setstore &lt;КОД&gt;</code>\n"
         "• Для прохождения чек-листа нужна роль auditor\n"
     )
-    await update.message.reply_html(text)
+    await update.effective_chat.send_message(text, parse_mode="HTML")
+
+async def cmd_auditor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "<b>Роль: Auditor</b>\n"
+        "• Всё как у viewer\n"
+        "• Запуск чек-листа: <code>/checklist</code>\n"
+        "• Важно: заранее выбрать магазин: <code>/setstore &lt;КОД&gt;</code>\n"
+    )
+    await update.effective_chat.send_message(text, parse_mode="HTML")
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.effective_chat.send_message("Команда только для администратора.")
+        return
+    text = (
+        "<b>Роль: Admin</b>\n"
+        "• Модерация заявок: <code>/pending</code>\n"
+        "• Назначить роль: <code>/setrole &lt;auditor|viewer&gt; &lt;user_id&gt; [&lt;КОД&gt;]</code>\n"
+        "• Список привязок (кто за что): <code>/bindings</code>\n"
+    )
+    await update.effective_chat.send_message(text, parse_mode="HTML")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Список привязок для админа («кто за что»)
+# ──────────────────────────────────────────────────────────────────────────────
+async def cmd_bindings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.effective_chat.send_message("Команда только для администратора.")
+        return
+    if not STAFF:
+        await update.effective_chat.send_message("Пока нет пользователей.")
+        return
+    esc = lambda s: html.escape(str(s if s is not None else "—"))
+    lines = ["<b>Привязки ролей:</b>"]
+    for uid, prof in sorted(STAFF.items(), key=lambda kv: kv[0]):
+        role = prof.get("role") or "viewer"
+        uname = ("@" + prof.get("username")) if prof.get("username") else "—"
+        name = prof.get("name") or "—"
+        cur = prof.get("current_store") or "—"
+        cur_h = STORE_CATALOG.get(prof.get("current_store"), "—") if prof.get("current_store") else "—"
+        stores_list = ", ".join(prof.get("stores") or []) or "не ограничено"
+        lines.append(
+            f"• <code>{uid}</code> {esc(uname)} — {esc(name)}\n"
+            f"  Роль: <b>{esc(role)}</b>; Текущий: <b>{esc(cur)}</b> — {esc(cur_h)}\n"
+            f"  Магазины: {esc(stores_list)}"
+        )
+    await update.effective_chat.send_message("\n".join(lines), parse_mode="HTML")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Бизнес-логика чек-листа
@@ -596,8 +670,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store_line = f"*{prof['current_store']}*" if prof.get("current_store") else "—"
     await update.effective_chat.send_message(
         "Привет! Регистрация теперь с модерацией:\n"
-        "• /register <КОД_МАГАЗИНА> <СЕКРЕТ_РОЛИ>\n"
-        "• или deep-link t.me/{username}?start=<КОД> (только магазин)\n\n"
+        "• <code>/register &lt;КОД_МАГАЗИНА&gt; &lt;СЕКРЕТ_РОЛИ&gt;</code>\n"
+        "• или deep-link t.me/{username}?start=&lt;КОД&gt; (только магазин)\n\n"
         f"Текущий магазин: {store_line}. Роль: *{_role_for_display(u.id, prof)}*.\n"
         "Список кодов: /stores",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -735,6 +809,9 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("setstore", cmd_setstore))
     app_.add_handler(CommandHandler("setrole", cmd_setrole))
     app_.add_handler(CommandHandler("viewer", cmd_viewer))
+    app_.add_handler(CommandHandler("auditor", cmd_auditor))
+    app_.add_handler(CommandHandler("admin", cmd_admin))
+    app_.add_handler(CommandHandler("bindings", cmd_bindings))
     # СНАЧАЛА — специфические callback-и, потом общий.
     app_.add_handler(CallbackQueryHandler(reg_callbacks, pattern=r"^reg:"))
     app_.add_handler(CallbackQueryHandler(cl_callback, pattern=r"^cl:"))
