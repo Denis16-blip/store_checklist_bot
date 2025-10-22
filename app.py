@@ -1,8 +1,9 @@
-# app.py — чек-лист + модерация + подписки + ТОМ/RD + TZ + напоминания
+# app.py — чек-лист + саморегистрация с модерацией + подписки TOM/RD + TZ + (опц.) уведомления
 import os
 import json
 import threading
 import asyncio
+import warnings
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import html
@@ -20,7 +21,11 @@ from telegram.ext import (
     ContextTypes
 )
 from telegram.error import BadRequest
+from telegram.warnings import PTBUserWarning
 import httpx
+
+# 🔇 Спрячем предупреждение PTB про JobQueue, если его нет
+warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV / Globals
@@ -52,48 +57,24 @@ def iso_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Справочники магазинов
+# Справочники магазинов (сокращён из твоего списка + добавлены недостающие)
 # ──────────────────────────────────────────────────────────────────────────────
 STORE_CATALOG: dict[str, str] = {
-    "C00X": "RU_ABAKAN_Ametist_SPORT",
-    "C0RG": "RU_ARKHANGELSK_TitanArena_SPORT",
-    "C082": "RU_GELENDZHIK_Lenina_SPORT",
-    "C0JP": "RU_IRKUTSK_ModnyKvartal_SPORT",
-    "C03F": "RU_IZHEVSK_Pushkinskaya_SPORT",
-    "C09Z": "RU_KALUGA_RIO_SPORT",
-    "C0JN": "RU_KRASNODAR_Galereya_SPORT",
-    "C0BW": "RU_KRASNODАР_OzMoll_SPORT",
-    "C0SL": "RU_MOSCOW_Afimall_SPORT",
-    "C0LU": "RU_MOSCOW_Aviapark_SPORT",
-    "C0VT": "RU_MOSCOW_Evropolis_SPORT",
-    "C0TY": "RU_MOSCOW_KashirskayaPlaza_SPORT",
-    "C0VY": "RU_MOSCOW_KM7_SPORT",
-    "C0OI": "RU_MOSCOW_Kolumbus_SPORT",
-    "C024": "RU_MOSCOW_KrasnayaPresnya_SPORT",
-    "C0GN": "RU_MOSCOW_MegaBelayaDacha_SPORT",
-    "C0GJ": "RU_MOSCOW_MegaBelayaDacha_URBAN",
-    "C0VU": "RU_MOSCOW_Metropolis_SPORT",
-    "C022": "RU_MOSCOW_OkhotnyRyad_URBAN",
-    "C0WD": "RU_MOSCOW_PaveletskayaPlaza_SPORT",
-    "C25Q": "RU_MOSCOW_Salaris_SPORT",
-    "C0TQ": "RU_MOSCOW_VegasKuncevo_SPORT",
-    "C0NJ": "RU_MOSCOW_VegasSiti_SPORT",
-    "C047": "RU_MOSCOW_Vegas_SPORT",
-    "C0IZ": "RU_MYTISHCHI_MytishchiKrasnykit_SPORT",
-    "C0VN": "RU_NOVOROSSIYSK_KrasnayaPloshchad_SPORT",
-    "C00K": "RU_NOVOSIBIRSK_TTSAura_SPORT",
-    "C0DY": "RU_OBNINSK_TriumfPlaza_SPORT",
-    "C0VB": "RU_OMSK_Mega_SPORT",
-    "C0WF": "RU_PERM_Planeta_SPORT",
-    "C08E": "RU_SAINT-PETERSBURG_Galereya_SPORT",
-    "C0OQ": "RU_SAINT-PETERSBURG_Leto_SPORT",
-    "C081": "RU_SARATOV_TriumfMoll_SPORT",
-    "C0WE": "RU_SOCHI_MoreMoll_SPORT",
-    "C0EI": "RU_SURGUT_Aura_SPORT",
-    "C0SM": "RU_TULA_Maksi_SPORT",
-    "C085": "RU_VORONEZH_GalereyaChizhova_SPORT",
-    "C0KH": "RU_YAROSLAVL_Aura_SPORT",
-    "C002": "RU_YUZHNO-SAKHALINSK_SitiMoll_SPORT",
+    "C00X":"RU_ABAKAN_Ametist_SPORT","C0RG":"RU_ARKHANGELSK_TitanArena_SPORT","C082":"RU_GELENDZHIK_Lenina_SPORT",
+    "C0JP":"RU_IRKUTSK_ModnyKvartal_SPORT","C03F":"RU_IZHEVSK_Pushkinskaya_SPORT","C09Z":"RU_KALUGA_RIO_SPORT",
+    "C0JN":"RU_KRASNODAR_Galereya_SPORT","C0BW":"RU_KRASNODАР_OzMoll_SPORT",
+    "C0SL":"RU_MOSCOW_Afimall_SPORT","C0LU":"RU_MOSCOW_Aviapark_SPORT","C0VT":"RU_MOSCOW_Evropolis_SPORT",
+    "C0TY":"RU_MOSCOW_KashirskayaPlaza_SPORT","C0VY":"RU_MOSCOW_KM7_SPORT","C0OI":"RU_MOSCOW_Kolumbus_SPORT",
+    "C024":"RU_MOSCOW_KrasnayaPresnya_SPORT","C0GN":"RU_MOSCOW_MegaBelayaDacha_SPORT","C0GJ":"RU_MOSCOW_MegaBelayaDacha_URBAN",
+    "C0VU":"RU_MOSCOW_Metropolis_SPORT","C022":"RU_MOSCOW_OkhotnyRyad_URBAN","C0WD":"RU_MOSCOW_PaveletskayaPlaza_SPORT",
+    "C25Q":"RU_MOSCOW_Salaris_SPORT","C0TQ":"RU_MOSCOW_VegasKuncevo_SPORT","C0NJ":"RU_MOSCOW_VegasSiti_SPORT",
+    "C047":"RU_MOSCOW_Vegas_SPORT",
+    "C0IZ":"RU_MYTISHCHI_MytishchiKrasnykit_SPORT","C0VN":"RU_NOVOROSSIYSK_KrasnayaPloshchad_SPORT",
+    "C00K":"RU_NOVOSIBIRSK_TTSAura_SPORT","C0DY":"RU_OBNINSK_TriumfPlaza_SPORT","C0VB":"RU_OMSK_Mega_SPORT",
+    "C0WF":"RU_PERM_Planeta_SPORT","C08E":"RU_SAINT-PETERSBURG_Galereya_SPORT","C0OQ":"RU_SAINT-PETERSBURG_Leto_SPORT",
+    "C081":"RU_SARATOV_TriumfMoll_SPORT","C0WE":"RU_SOCHI_MoreMoll_SPORT","C0EI":"RU_SURGUT_Aura_SPORT",
+    "C0SM":"RU_TULA_Maksi_SPORT","C085":"RU_VORONEZH_GalereyaChizhova_SPORT","C0KH":"RU_YAROSLAVL_Aura_SPORT",
+    "C002":"RU_YUZHNO-SAKHALINSK_SitiMoll_SPORT",
 }
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -151,10 +132,10 @@ def _upd_from_user(user, prof):
 
 def must_have_store(update: Update, prof: dict) -> str | None:
     if not prof.get("current_store"):
-        return "Сначала выбери магазин: /stores → /setstore <КОД> или /register <КОД> <СЕКРЕТ>"
+        return "Сначала выбери магазин: /stores → /setstore &lt;КОД&gt; или /register &lt;КОД&gt; &lt;СЕКРЕТ&gt;"
     cur = prof["current_store"]
     if prof["stores"] and cur not in prof["stores"]:
-        return "Текущий магазин не входит в твой список. Выбери другой: /setstore <КОД>"
+        return "Текущий магазин не входит в твой список. Выбери другой: /setstore &lt;КОД&gt;"
     return None
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -771,7 +752,7 @@ async def tom_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Профиль/магазины/ролевая справка
+# Профиль/магазины/роль-справка/TZ
 # ──────────────────────────────────────────────────────────────────────────────
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user; prof = get_profile(u.id)
@@ -824,9 +805,6 @@ async def cmd_setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prof["current_store"] = store_code
             if role == "auditor":
                 prof["stores"] = [store_code]  # ← фиксируем доступ аудитору к одному магазину
-            else:
-                if prof["stores"] is not None and store_code not in prof["stores"]:
-                    prof["stores"].append(store_code)
         else:
             await update.effective_chat.send_message(f"Внимание: код магазина не найден: <b>{html.escape(store_code)}</b>", parse_mode="HTML")
     _save_staff()
@@ -884,9 +862,6 @@ async def cmd_bindings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• <code>{uid}</code> {esc(uname)} — {esc(name)}\n  Роль: <b>{esc(role)}</b>; Текущий: <b>{esc(cur)}</b> — {esc(cur_h)}\n  Магазины: {esc(stores_list)}\n  Подписки: {esc(subs_txt)}")
     await update.effective_chat.send_message("\n".join(lines), parse_mode="HTML")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Таймзона + ТОМ reload
-# ──────────────────────────────────────────────────────────────────────────────
 async def cmd_settz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user; prof = get_profile(u.id)
     if not context.args:
@@ -906,14 +881,14 @@ async def cmd_reload_tom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message("Группы ТОМ перечитаны.")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Чек-лист: запуск/кнопки/финал + уведомления и лог
+# Чек-лист: запуск/кнопки/финал + (уведомление подписчикам) и лог
 # ──────────────────────────────────────────────────────────────────────────────
 async def cmd_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user; prof = get_profile(u.id)
     if not (prof["role"] == "auditor" or is_admin(u.id)):
         await update.effective_chat.send_message("Твоя роль — viewer. Для прохождения чек-листа нужна роль auditor."); return
     err = must_have_store(update, prof)
-    if err: await update.effective_chat.send_message(err); return
+    if err: await update.effective_chat.send_message(err, parse_mode="HTML"); return
     chat_id = update.effective_chat.id; st = _cl_get(chat_id); si = st["sec"]
     await update.effective_chat.send_message(_fmt_section_text(si, st), reply_markup=_kb_section(si, st), parse_mode="Markdown")
 
@@ -987,7 +962,7 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Планировщик (JobQueue): отчёты и напоминания
+# Планировщик (JobQueue) — безопасно: только если доступен
 # ──────────────────────────────────────────────────────────────────────────────
 def _user_now_in_tz(uid: int) -> datetime:
     tz = get_profile(uid).get("tz", "Europe/Moscow")
@@ -1019,7 +994,6 @@ def _recent_runs(days: int) -> dict[str, datetime]:
     return last
 
 async def job_viewers_weekly(context: ContextTypes.DEFAULT_TYPE):
-    now_utc = datetime.now(timezone.utc)
     recent = _recent_runs(7)
     for uid in list(USER_SUBS.keys()):
         local = _user_now_in_tz(uid)
@@ -1031,7 +1005,7 @@ async def job_viewers_weekly(context: ContextTypes.DEFAULT_TYPE):
         if not stores: continue
         not_done = sorted([s for s in stores if s not in recent])
         if not not_done:
-            msg = "Еженедельный отчёт: по твоим подпискам всё ОК ✅ (в последние 7 дней есть прохождения)."
+            msg = "Еженедельный отчёт: по твоим подпискам всё ОК ✅ (за 7 дней есть прохождения)."
         else:
             pretty = " ".join(not_done)
             msg = f"Еженедельный отчёт: не пройдено за неделю — {pretty}"
@@ -1092,7 +1066,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(payload) == 2:
         code = payload[1].strip().upper()
         if code in STORE_CATALOG and (is_admin(u.id) or prof.get("role") != "auditor"):
-            # deep-link смену магазина запрещаем аудитору
+            # аудитору deep-link смену магазина не даём
             prof["current_store"] = code; _save_staff()
     kb = [[InlineKeyboardButton("Проверка", callback_data="ping"),
            InlineKeyboardButton("Чек-лист", callback_data="cl:start")]]
@@ -1166,7 +1140,7 @@ def build_application() -> Application:
     app_.add_handler(CallbackQueryHandler(on_button, block=False))
     return app_
 
-# PTB init + jobs
+# PTB init + jobs (безопасно)
 async def _ptb_init_async():
     global _app, _ptb_ready, BOT_USERNAME
     log("PTB: build application…")
@@ -1174,12 +1148,19 @@ async def _ptb_init_async():
     log("PTB: application.initialize()…")
     await _app.initialize()
     me = await _app.bot.get_me(); BOT_USERNAME = me.username
-    # JobQueue — запускаем повторяющиеся задачи раз в час
-    jq = _app.job_queue
-    jq.run_repeating(job_viewers_weekly, interval=3600, first=60)
-    jq.run_repeating(job_viewers_daily, interval=3600, first=120)
-    jq.run_repeating(job_auditors_weekly, interval=3600, first=180)
-    jq.run_repeating(job_auditors_hourly_overdue, interval=3600, first=240)
+
+    # Попробуем включить JobQueue, если доступен
+    jq = getattr(_app, "job_queue", None)
+    if jq is None:
+        log("PTB: JobQueue недоступен — планировщик уведомлений отключён (это ок).")
+    else:
+        # Раз в час проверяем и отправляем при подходящих локальных условиях
+        jq.run_repeating(job_viewers_weekly, interval=3600, first=60)
+        jq.run_repeating(job_viewers_daily, interval=3600, first=120)
+        jq.run_repeating(job_auditors_weekly, interval=3600, first=180)
+        jq.run_repeating(job_auditors_hourly_overdue, interval=3600, first=240)
+        log("PTB: JobQueue — задания зарегистрированы.")
+
     _ptb_ready = True
     log(f"PTB: READY as @{BOT_USERNAME}")
 
@@ -1279,6 +1260,4 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
-
-
 
