@@ -391,12 +391,16 @@ def _cl_get(cid: int):
     return st
 
 def _human_sec_progress(st) -> tuple[int, int]:
-    done = 0; total = 0
+    done = 0
+    total = 0
     for si, sec in enumerate(CHECKLIST):
         total += len(sec["items"])
         sec_marks = st["marks"].get(si, {})
-        for ii in range(len(sec["items"])): if sec_marks.get(ii) is True: done += 1
+        for ii in range(len(sec["items"])):
+            if sec_marks.get(ii) is True:
+                done += 1
     return done, total
+
 
 def _fmt_section_text(si: int, st) -> str:
     sec = CHECKLIST[si]
