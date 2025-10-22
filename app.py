@@ -10,7 +10,7 @@ import html  # для экранирования в HTML
 from flask import Flask, request, Response
 from dotenv import load_dotenv
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, BotCommandScopeChat
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
 )
@@ -77,7 +77,7 @@ STORE_CATALOG: dict[str, str] = {
     "C002": "RU_YUZHNO-SAKHALINSK_SitiMoll_SPORT",
     "C082": "RU_GELENDZHIK_Lenina_SPORT",
     "C0JN": "RU_KRASNODAR_Galereya_SPORT",
-    "C0BW": "RU_KRASNODAR_OzMoll_SPORT",
+    "C0BW": "RU_KRASNODАР_OzMoll_SPORT",
     "C0VN": "RU_NOVOROSSIYSK_KrasnayaPloshchad_SPORT",
     "C081": "RU_SARATOV_TriumfMoll_SPORT",
     "C0WE": "RU_SOCHI_MoreMoll_SPORT",
@@ -137,6 +137,53 @@ def must_have_store(update: Update, prof: dict) -> str | None:
     if prof["stores"] and cur not in prof["stores"]:
         return "Текущий магазин не входит в твой список. Выбери другой: /setstore <КОД>"
     return None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Меню команд по ролям (Bot Menu) + helper для обновления
+# ──────────────────────────────────────────────────────────────────────────────
+ROLE_COMMANDS: dict[str, list[BotCommand]] = {
+    "viewer": [
+        BotCommand("start", "начать"),
+        BotCommand("register", "запросить доступ (код+секрет)"),
+        BotCommand("whoami", "профиль"),
+        BotCommand("stores", "список магазинов"),
+        BotCommand("setstore", "выбрать магазин"),
+        BotCommand("viewer", "что может viewer"),
+    ],
+    "auditor": [
+        BotCommand("start", "начать"),
+        BotCommand("register", "запросить доступ (код+секрет)"),
+        BotCommand("whoami", "профиль"),
+        BotCommand("stores", "список магазинов"),
+        BotCommand("setstore", "выбрать магазин"),
+        BotCommand("checklist", "чек-лист"),
+        BotCommand("viewer", "что может viewer"),
+    ],
+    "admin": [
+        BotCommand("start", "начать"),
+        BotCommand("register", "запросить доступ (код+секрет)"),
+        BotCommand("whoami", "профиль"),
+        BotCommand("stores", "список магазинов"),
+        BotCommand("setstore", "выбрать магазин"),
+        BotCommand("checklist", "чек-лист"),
+        BotCommand("pending", "заявки на модерацию"),
+        BotCommand("setrole", "назначить роль"),
+        BotCommand("viewer", "что может viewer"),
+    ],
+}
+
+def _role_for_display(uid: int, prof: dict) -> str:
+    return "admin" if is_admin(uid) else prof.get("role", "viewer")
+
+async def refresh_chat_commands(bot, chat_id: int, user_id: int):
+    """Обновляет список команд (над клавиатурой) под роль пользователя в данном чате."""
+    prof = get_profile(user_id)
+    role = _role_for_display(user_id, prof)
+    commands = ROLE_COMMANDS.get(role, ROLE_COMMANDS["viewer"])
+    try:
+        await bot.set_my_commands(commands=commands, scope=BotCommandScopeChat(chat_id))
+    except Exception as e:
+        log(f"set_my_commands error for chat {chat_id}: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Чек-лист и фото
@@ -336,6 +383,8 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prof["current_store"] = store
         _upd_from_user(u, prof)
         _save_staff()
+        # обновим меню для админа (его личный чат)
+        await refresh_chat_commands(context.bot, update.effective_chat.id, u.id)
         await update.effective_chat.send_message(
             f"Админ подтверждён сразу. Роль: <b>{html.escape(role)}</b>. Магазин: <b>{html.escape(store)}</b>.",
             parse_mode="HTML",
@@ -416,6 +465,8 @@ async def reg_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"магазин: <b>{html.escape(prof['current_store'])}</b>.",
                 parse_mode="HTML",
             )
+            # обновим меню команд в личке пользователя (chat_id == user_id для приватного чата)
+            await refresh_chat_commands(context.bot, user_id, user_id)
         except Exception as e:
             log(f"notify user approve error: {e}")
         return
@@ -440,9 +491,6 @@ async def reg_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────────────────────────
 # Команды профиля/магазинов
 # ──────────────────────────────────────────────────────────────────────────────
-def _role_for_display(uid: int, prof: dict) -> str:
-    return "admin" if is_admin(uid) else prof.get("role", "viewer")
-
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     prof = get_profile(u.id)
@@ -508,6 +556,20 @@ async def cmd_setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prof["role"] = role
     _save_staff()
     await update.effective_chat.send_message(f"Роль пользователя {target} установлена: <b>{html.escape(role)}</b>", parse_mode="HTML")
+    # обновим меню команд для целевого пользователя (в его личном чате)
+    await refresh_chat_commands(context.bot, target, target)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Роль viewer — краткая справка
+# ──────────────────────────────────────────────────────────────────────────────
+async def cmd_viewer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "<b>Роль: Viewer</b>\n"
+        "• Видит профиль и магазины: /whoami, /stores\n"
+        "• Может выбрать магазин для просмотра: /setstore <КОД>\n"
+        "• Для прохождения чек-листа нужна роль auditor\n"
+    )
+    await update.message.reply_html(text)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Бизнес-логика чек-листа
@@ -516,6 +578,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     prof = get_profile(u.id)
     _upd_from_user(u, prof)
+
+    # обновим меню команд под текущую роль в этом чате
+    await refresh_chat_commands(context.bot, update.effective_chat.id, u.id)
 
     payload = update.message.text.split(maxsplit=1)
     if len(payload) == 2:
@@ -669,6 +734,7 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("stores", cmd_stores))
     app_.add_handler(CommandHandler("setstore", cmd_setstore))
     app_.add_handler(CommandHandler("setrole", cmd_setrole))
+    app_.add_handler(CommandHandler("viewer", cmd_viewer))
     # СНАЧАЛА — специфические callback-и, потом общий.
     app_.add_handler(CallbackQueryHandler(reg_callbacks, pattern=r"^reg:"))
     app_.add_handler(CallbackQueryHandler(cl_callback, pattern=r"^cl:"))
@@ -793,5 +859,6 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
 
 
