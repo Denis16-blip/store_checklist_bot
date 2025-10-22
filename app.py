@@ -1,4 +1,4 @@
-# app.py — чек-лист + саморегистрация с модерацией + подписки TOM/RD + TZ + (опц.) уведомления
+# app.py — чек-лист + саморегистрация с модерацией + подписки TOM/RD + TZ + (опц.) уведомления + мастер выбора роли
 import os
 import json
 import threading
@@ -62,7 +62,7 @@ def iso_now():
 STORE_CATALOG: dict[str, str] = {
     "C00X":"RU_ABAKAN_Ametist_SPORT","C0RG":"RU_ARKHANGELSK_TitanArena_SPORT","C082":"RU_GELENDZHIK_Lenina_SPORT",
     "C0JP":"RU_IRKUTSK_ModnyKvartal_SPORT","C03F":"RU_IZHEVSK_Pushkinskaya_SPORT","C09Z":"RU_KALUGA_RIO_SPORT",
-    "C0JN":"RU_KRASNODAR_Galereya_SPORT","C0BW":"RU_KRASNODАР_OzMoll_SPORT",
+    "C0JN":"RU_KRASNODAR_Galereya_SPORT","C0BW":"RU_KRASNОДАР_OzMoll_SPORT",
     "C0SL":"RU_MOSCOW_Afimall_SPORT","C0LU":"RU_MOSCOW_Aviapark_SPORT","C0VT":"RU_MOSCOW_Evropolis_SPORT",
     "C0TY":"RU_MOSCOW_KashirskayaPlaza_SPORT","C0VY":"RU_MOSCOW_KM7_SPORT","C0OI":"RU_MOSCOW_Kolumbus_SPORT",
     "C024":"RU_MOSCOW_KrasnayaPresnya_SPORT","C0GN":"RU_MOSCOW_MegaBelayaDacha_SPORT","C0GJ":"RU_MOSCOW_MegaBelayaDacha_URBAN",
@@ -107,7 +107,7 @@ def _append_jsonl(path: Path, obj: dict):
     except Exception as e:
         log(f"append {path.name} error: {e}")
 
-# staff: {user_id: {role, stores, current_store, username, name, tz?, inactive?}}
+# staff: {user_id: {role, stores, current_store, username, name, tz?, inactive?, intended_role?, awaiting_approval?, approved?}}
 STAFF: dict[int, dict] = {int(k): v for k, v in _read_json(STAFF_FILE, {}).items()}
 PENDING: dict[str, dict] = _read_json(PENDING_FILE, {})
 
@@ -395,9 +395,7 @@ def _human_sec_progress(st) -> tuple[int, int]:
     for si, sec in enumerate(CHECKLIST):
         total += len(sec["items"])
         sec_marks = st["marks"].get(si, {})
-        for ii in range(len(sec["items"])):
-            if sec_marks.get(ii) is True:
-                done += 1
+        for ii in range(len(sec["items"])): if sec_marks.get(ii) is True: done += 1
     return done, total
 
 def _fmt_section_text(si: int, st) -> str:
@@ -432,17 +430,6 @@ def _kb_section(si: int, st):
     rows.append([InlineKeyboardButton("♻️ Сброс секции", callback_data="cl:resetsec")])
     return InlineKeyboardMarkup(rows)
 
-def _fmt_progress_text(st) -> str:
-    done, total = _human_sec_progress(st)
-    pct = int(round(100*done/total)) if total else 0
-    lines = [f"Готово: *{done}/{total}* ({pct}%)"]
-    for si, sec in enumerate(CHECKLIST):
-        sec_total = len(sec["items"])
-        sec_done = sum(1 for ii in range(sec_total) if st["marks"].get(si, {}).get(ii) is True)
-        tick = "✅" if sec_done == sec_total and sec_total > 0 else ("➖" if sec_done else "⬜️")
-        lines.append(f"{tick} {sec['title']} — {sec_done}/{sec_total}")
-    return "\n".join(lines)
-
 async def _safe_edit(q, text: str, reply_markup=None, parse_mode: str | None = "Markdown"):
     try:
         await q.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -452,6 +439,54 @@ async def _safe_edit(q, text: str, reply_markup=None, parse_mode: str | None = "
             except Exception: pass
         else:
             raise
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Мастер выбора роли (новое)
+# ──────────────────────────────────────────────────────────────────────────────
+def _kb_role_picker():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏪 Директор / Заместитель", callback_data="role:pick:auditor")],
+        [InlineKeyboardButton("👀 Наблюдатель (VM, ТОМ, РД)", callback_data="role:pick:viewer")],
+    ])
+
+async def role_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data.startswith("role:"): return
+    _, action, role = (q.data.split(":", 2) + ["", ""])[:3]
+    if action != "pick" or role not in ("auditor", "viewer"):
+        await q.answer("Неизвестный выбор", show_alert=True); return
+
+    uid = q.from_user.id
+    prof = get_profile(uid)
+    prof["intended_role"] = role  # ориентация до модерации
+    _save_staff()
+
+    if role == "auditor":
+        text = (
+            "✅ Выбрано: <b>Директор / Заместитель</b>\n\n"
+            "Дальше — подай заявку:\n"
+            "1) Возьми <b>секрет для директоров</b> у администратора\n"
+            "2) Отправь:\n"
+            "<code>/register &lt;КОД_МАГАЗИНА&gt; &lt;СЕКРЕТ_ДИРЕКТОРА&gt;</code>\n\n"
+            "После одобрения магазин будет <b>закреплён</b> за тобой.\n"
+            "Чек-лист: /checklist  •  Коды: /stores"
+        )
+    else:
+        text = (
+            "✅ Выбрано: <b>Наблюдатель (VM, ТОМ, РД)</b>\n\n"
+            "Теперь подай заявку:\n"
+            "1) Возьми <b>секрет наблюдателя</b> у администратора\n"
+            "2) Отправь:\n"
+            "<code>/register &lt;ЛЮБОЙ_КОД_МАГАЗИНА&gt; &lt;СЕКРЕТ_НАБЛЮДАТЕЛЯ&gt;</code>\n\n"
+            "После одобрения настрой подписки: /tom (ТОМ или RD — все магазины).\n"
+            "Часовой пояс для уведомлений: <code>/settz Europe/Moscow</code>"
+        )
+
+    try:
+        await q.edit_message_text(text, parse_mode="HTML")
+    except Exception:
+        await q.message.reply_text(text, parse_mode="HTML")
+    await q.answer()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Модерация регистрации
@@ -501,6 +536,8 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prof["current_store"] = store
         if role == "auditor":
             prof["stores"] = [store]
+        prof["approved"] = True
+        prof.pop("awaiting_approval", None)
         _upd_from_user(u, prof); _save_staff()
         await refresh_chat_commands(context.bot, update.effective_chat.id, u.id)
         await update.effective_chat.send_message(
@@ -512,6 +549,10 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        "username": u.username or "", "name": f"{u.first_name or ''} {u.last_name or ''}".strip(),
                        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
     _save_pending()
+    # пометим, что ждём модерации → мастер роли больше не показываем
+    prof = get_profile(u.id)
+    prof["awaiting_approval"] = True
+    _save_staff()
     await update.effective_chat.send_message(
         f"Заявка отправлена админу. Номер: <code>{html.escape(req_id)}</code>.\nПосле одобрения придёт уведомление.",
         parse_mode="HTML"
@@ -548,6 +589,8 @@ async def reg_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prof["current_store"] = r["store"]
         if r["role"] == "auditor":
             prof["stores"] = [r["store"]]  # ← фиксируем магазин для аудитора
+        prof["approved"] = True
+        prof.pop("awaiting_approval", None)
         _save_staff()
         del PENDING[req_id]; _save_pending()
         await q.answer("Одобрено ✅")
@@ -563,6 +606,12 @@ async def reg_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if action == "reject":
         del PENDING[req_id]; _save_pending()
+        try:
+            prof = get_profile(user_id)
+            prof.pop("awaiting_approval", None)
+            _save_staff()
+        except Exception:
+            pass
         await q.answer("Отклонено ❌")
         try: await q.edit_message_text(q.message.text + "\n\n<b>🔔 Статус: отклонено.</b>", parse_mode="HTML")
         except Exception: pass
@@ -673,6 +722,7 @@ async def cmd_deactivate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except: await update.effective_chat.send_message("user_id должен быть числом."); return
     prof = get_profile(target)
     prof["role"] = "viewer"; prof["stores"] = []; prof["current_store"] = None; prof["inactive"] = True
+    prof.pop("approved", None); prof.pop("awaiting_approval", None)
     _save_staff()
     _clear_all_subs_for_user(target)
     await update.effective_chat.send_message(
@@ -1062,12 +1112,26 @@ async def job_auditors_hourly_overdue(context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user; prof = get_profile(u.id); _upd_from_user(u, prof)
     await refresh_chat_commands(context.bot, update.effective_chat.id, u.id)
+
+    # Экран выбора роли до регистрации (мастер)
+    if not prof.get("approved") and not prof.get("awaiting_approval"):
+        text = (
+            "👋 <b>Добро пожаловать в @VM_lamoda_bot</b>\n\n"
+            "Выбери, кто ты:\n"
+            "• <b>Директор / Заместитель</b> — проходишь чек-лист своего магазина.\n"
+            "• <b>Наблюдатель (VM, ТОМ, РД)</b> — получаешь отчёты и уведомления по магазинам.\n\n"
+            "⬇️ Нажми кнопку ниже:"
+        )
+        await update.effective_chat.send_message(text, parse_mode="HTML", reply_markup=_kb_role_picker())
+        return
+
     payload = update.message.text.split(maxsplit=1)
     if len(payload) == 2:
         code = payload[1].strip().upper()
         if code in STORE_CATALOG and (is_admin(u.id) or prof.get("role") != "auditor"):
             # аудитору deep-link смену магазина не даём
             prof["current_store"] = code; _save_staff()
+
     kb = [[InlineKeyboardButton("Проверка", callback_data="ping"),
            InlineKeyboardButton("Чек-лист", callback_data="cl:start")]]
     if _role_for_display(u.id, prof) != "auditor":
@@ -1134,6 +1198,7 @@ def build_application() -> Application:
     app_.add_handler(CommandHandler("reload_tom", cmd_reload_tom))
     app_.add_handler(CommandHandler("settz", cmd_settz))
     # callbacks
+    app_.add_handler(CallbackQueryHandler(role_pick_callback, pattern=r"^role:"))
     app_.add_handler(CallbackQueryHandler(reg_callbacks, pattern=r"^reg:"))
     app_.add_handler(CallbackQueryHandler(cl_callback, pattern=r"^cl:"))
     app_.add_handler(CallbackQueryHandler(tom_callbacks, pattern=r"^tom:"))
