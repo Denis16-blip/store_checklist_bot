@@ -469,7 +469,7 @@ async def role_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     prof = get_profile(uid)
     prof["intended_role"] = role  # ориентация до модерации
     _save_staff()
-f role == "auditor":
+    if role == "auditor":
         text = (
             "✅ Выбрано: <b>Директор / Заместитель</b>\n\n"
             "Дальше — подай заявку:\n"
@@ -769,7 +769,7 @@ async def tom_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q or not q.data.startswith("tom:"): return
     uid = q.from_user.id
     _, action, payload = (q.data.split(":", 2) + ["", ""])[:3]
-f action == "mine":
+if action == "mine":
         subs = USER_SUBS.get(uid, set())
         if subs and "*" in subs:
             await q.answer("Подписан на ВСЕ")
@@ -779,7 +779,7 @@ f action == "mine":
         await q.answer("Твои подписки")
         await _safe_edit(q, f"Твои подписки: <b>{html.escape(rows)}</b>", parse_mode="HTML")
         return
-f action == "rd" and payload == "toggle":
+if action == "rd" and payload == "toggle":
         if "*" in USER_SUBS.get(uid, set()):
             _unsubscribe_all(uid)
             await q.answer("Снял флаг «ВСЕ»")
@@ -790,7 +790,7 @@ f action == "rd" and payload == "toggle":
             await q.edit_message_reply_markup(reply_markup=_kb_tom(uid))
         except Exception: pass
         return
-f action == "toggle":
+if action == "toggle":
         g = TOM_GROUPS.get(payload)
         if not g:
             await q.answer("Группа не найдена", show_alert=True); return
@@ -1017,10 +1017,7 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "progress":
         await q.answer("Прогресс")
-        await _safe_edit(q, _fmt_progress_text(st) + "
-
-Нажми «➡ Далее», чтобы продолжить.", reply_markup=_kb_section(si, st)); return
-
+        await _safe_edit(q, _fmt_progress_text(st) + "\n\nНажми «➡ Далее», чтобы продолжить.", reply_markup=_kb_section(si, st)); return
     if action == "goto":
         buttons = []
         for i, sec in enumerate(CHECKLIST):
@@ -1061,9 +1058,7 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if store_code:
                 _log_run(store_code, u.id, st)
                 await _notify_viewers_on_finish(context, store_code, u.id, st)
-            text = "🎉 Чек-лист завершён!
-
-" + _fmt_progress_text(st)
+            text = "🎉 Чек-лист завершён!\n\n" + _fmt_progress_text(st)
             try:
                 await _safe_edit(q, text)
             finally:
@@ -1386,4 +1381,5 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
 
