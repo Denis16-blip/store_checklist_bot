@@ -416,21 +416,43 @@ def _fmt_section_text(si: int, st) -> str:
     lines += ["", f"Прогресс: *{done}/{total}* ({pct}%)", "_Отмечай каждый пункт как ✅ или ❌. Без пропусков._"]
     return "\n".join(lines)
 
+
+def _fmt_progress_text(st) -> str:
+    """Format overall progress across all sections for Markdown."""
+    lines = ["*Прогресс по чек-листу*"]
+    done, total = _human_sec_progress(st)
+    pct = int(round(100 * done / total)) if total else 0
+    lines.append(f"Всего: *{done}/{total}* ({pct}%)")
+    for i, sec in enumerate(CHECKLIST):
+        sec_marks = st["marks"].get(i, {}) or {}
+        d = sum(1 for v in sec_marks.values() if v is True)
+        t = len(sec["items"])
+        if t == 0:
+            sym = "⬜️"
+        elif d == 0:
+            sym = "⬜️"
+        elif d == t:
+            sym = "✅"
+        else:
+            sym = "🟡"
+        lines.append(f"{i+1}. {sym} {sec['title']} — {d}/{t}")
+    lines.append("_Отмечай каждый пункт как ✅ или ❌. Без пропусков._")
+    return "\n".join(lines)
+
 def _kb_section(si: int, st):
     sec = CHECKLIST[si]
     sec_marks = st["marks"].get(si, {})
-    rows: list[list[InlineKeyboardButton]] = []
-    # Кнопки пунктов
+    rows = []
     for ii in range(len(sec["items"])):
         v = sec_marks.get(ii)
         sym = "✅" if v is True else ("❌" if v is False else "⬜️")
         rows.append([InlineKeyboardButton(f"{ii+1} {sym}", callback_data=f"cl:toggle:{ii}")])
-    # Навигация по секциям
+    # Навигация
     rows.append([
         InlineKeyboardButton("⬅ Назад", callback_data="cl:prev"),
         InlineKeyboardButton("➡ Далее", callback_data="cl:next"),
     ])
-    # Доп. действия
+    # Экстры
     extras = [InlineKeyboardButton("📋 Прогресс", callback_data="cl:progress")]
     if si in EXAMPLE_PHOTOS:
         extras.insert(0, InlineKeyboardButton("📷 Пример", callback_data="cl:photo"))
@@ -438,6 +460,7 @@ def _kb_section(si: int, st):
     rows.append([InlineKeyboardButton("📑 Перейти к разделу", callback_data="cl:goto")])
     rows.append([InlineKeyboardButton("♻️ Сброс секции", callback_data="cl:resetsec")])
     return InlineKeyboardMarkup(rows)
+
 
 async def _safe_edit(q, text: str, reply_markup=None, parse_mode: str | None = "Markdown"):
     try:
@@ -469,6 +492,7 @@ async def role_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     prof = get_profile(uid)
     prof["intended_role"] = role  # ориентация до модерации
     _save_staff()
+
     if role == "auditor":
         text = (
             "✅ Выбрано: <b>Директор / Заместитель</b>\n\n"
@@ -769,7 +793,8 @@ async def tom_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q or not q.data.startswith("tom:"): return
     uid = q.from_user.id
     _, action, payload = (q.data.split(":", 2) + ["", ""])[:3]
-if action == "mine":
+
+    if action == "mine":
         subs = USER_SUBS.get(uid, set())
         if subs and "*" in subs:
             await q.answer("Подписан на ВСЕ")
@@ -779,7 +804,8 @@ if action == "mine":
         await q.answer("Твои подписки")
         await _safe_edit(q, f"Твои подписки: <b>{html.escape(rows)}</b>", parse_mode="HTML")
         return
-if action == "rd" and payload == "toggle":
+
+    if action == "rd" and payload == "toggle":
         if "*" in USER_SUBS.get(uid, set()):
             _unsubscribe_all(uid)
             await q.answer("Снял флаг «ВСЕ»")
@@ -790,7 +816,8 @@ if action == "rd" and payload == "toggle":
             await q.edit_message_reply_markup(reply_markup=_kb_tom(uid))
         except Exception: pass
         return
-if action == "toggle":
+
+    if action == "toggle":
         g = TOM_GROUPS.get(payload)
         if not g:
             await q.answer("Группа не найдена", show_alert=True); return
@@ -938,19 +965,14 @@ async def cmd_reload_tom(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────────────────────────
 # Чек-лист: запуск/кнопки/финал + (уведомление подписчикам) и лог
 # ──────────────────────────────────────────────────────────────────────────────
-
 async def cmd_checklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user; prof = get_profile(u.id)
     if not (prof["role"] == "auditor" or is_admin(u.id)):
         await update.effective_chat.send_message("Твоя роль — viewer. Для прохождения чек-листа нужна роль auditor."); return
     err = must_have_store(update, prof)
     if err: await update.effective_chat.send_message(err, parse_mode="HTML"); return
-    chat_id = update.effective_chat.id
-    st = {"sec": 0, "marks": {}}
-    _cl_state[chat_id] = st
-    si = st["sec"]
+    chat_id = update.effective_chat.id; st = _cl_get(chat_id); si = st["sec"]
     await update.effective_chat.send_message(_fmt_section_text(si, st), reply_markup=_kb_section(si, st), parse_mode="Markdown")
-
 
 async def _notify_viewers_on_finish(context: ContextTypes.DEFAULT_TYPE, store_code: str, finished_by: int, st_obj):
     human = STORE_CATALOG.get(store_code, store_code)
@@ -966,7 +988,6 @@ def _log_run(store_code: str, auditor_id: int, st_obj):
     rec = {"ts": iso_now(), "store": store_code, "auditor": auditor_id, "done": done, "total": total}
     _append_jsonl(RUNS_FILE, rec)
 
-
 async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; u = q.from_user; prof = get_profile(u.id)
     if not (prof["role"] == "auditor" or is_admin(u.id)):
@@ -974,14 +995,8 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     err = must_have_store(update, prof)
     if err: await q.answer(err, show_alert=True); return
 
-    chat_id = q.message.chat_id
-    st = _cl_get(chat_id)
-    if not st:
-        st = {"sec": 0, "marks": {}}
-        _cl_state[chat_id] = st
-    data = q.data
-    action = data.split(":", 1)[1] if ":" in data else ""
-    si = st["sec"]
+    chat_id = q.message.chat_id; st = _cl_get(chat_id)
+    action = q.data.split(":", 1)[1]; si = st["sec"]
 
     if action == "start":
         st["sec"] = 0; st["marks"] = {}; si = 0
@@ -991,14 +1006,10 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "photo":
         files = EXAMPLE_PHOTOS.get(si)
         if files:
-            try:
-                await q.message.chat.send_photo(photo=files[0], caption=f"Пример: {CHECKLIST[si]['title']}")
-            except Exception as e:
-                log(f"send_photo error: {e}"); await q.answer("Не удалось отправить фото", show_alert=True)
-            else:
-                await q.answer("Пример отправлен")
-        else:
-            await q.answer("Для этой секции пока нет примера", show_alert=True)
+            try: await q.message.chat.send_photo(photo=files[0], caption=f"Пример: {CHECKLIST[si]['title']}")
+            except Exception as e: log(f"send_photo error: {e}"); await q.answer("Не удалось отправить фото", show_alert=True)
+            else: await q.answer("Пример отправлен")
+        else: await q.answer("Для этой секции пока нет примера", show_alert=True)
         return
 
     if action.startswith("toggle:"):
@@ -1011,31 +1022,13 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st)); return
 
     if action == "resetsec":
-        st["marks"][si] = {}
-        await q.answer("Секция сброшена")
+        st["marks"][si] = {}; await q.answer("Секция сброшена")
         await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st)); return
 
     if action == "progress":
+
         await q.answer("Прогресс")
         await _safe_edit(q, _fmt_progress_text(st) + "\n\nНажми «➡ Далее», чтобы продолжить.", reply_markup=_kb_section(si, st)); return
-    if action == "goto":
-        buttons = []
-        for i, sec in enumerate(CHECKLIST):
-            buttons.append([InlineKeyboardButton(f"{i+1}. {sec['title']}", callback_data=f"cl:goto_{i}")])
-        buttons.append([InlineKeyboardButton("↩ Назад", callback_data="cl:backtocur")])
-        await _safe_edit(q, "Выбери раздел для перехода:", reply_markup=InlineKeyboardMarkup(buttons)); return
-
-    if action.startswith("goto_"):
-        try:
-            target = int(action.split("_",1)[1])
-        except Exception:
-            await q.answer("Ошибка номера секции"); return
-        if 0 <= target < len(CHECKLIST):
-            st["sec"] = target; si = target
-            await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st)); return
-
-    if action == "backtocur":
-        await _safe_edit(q, _fmt_section_text(st["sec"], st), reply_markup=_kb_section(st["sec"], st)); return
 
     if action == "prev":
         if si <= 0:
@@ -1043,29 +1036,41 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["sec"] -= 1; si = st["sec"]
         await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st)); return
 
+    
+    if action == "goto":
+        buttons = []
+        for i, sec in enumerate(CHECKLIST):
+            buttons.append([InlineKeyboardButton(f"{i+1}. {sec['title']}", callback_data=f"cl:goto_{i}")])
+        buttons.append([InlineKeyboardButton("↩ Назад", callback_data="cl:backtocur")])
+        await _safe_edit(q, "Выбери раздел для перехода:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if action.startswith("goto_"):
+        try:
+            target = int(action.split("_")[1])
+        except Exception:
+            await q.answer("Ошибка номера секции", show_alert=True); return
+        if 0 <= target < len(CHECKLIST):
+            st["sec"] = target
+            await _safe_edit(q, _fmt_section_text(target, st), reply_markup=_kb_section(target, st))
+        return
+
+    if action == "backtocur":
+        si = st["sec"]
+        await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st))
+        return
+
     if action == "next":
-        sec = CHECKLIST[si]
-        filled = st["marks"].get(si, {})
-        missing = [i for i in range(len(sec["items"])) if i not in filled]
-        if missing:
-            await q.answer("Отметь все пункты (✅ или ❌) прежде чем продолжить", show_alert=True); return
         if si >= len(CHECKLIST) - 1:
             store_code = prof.get("current_store")
-            finish_key = f"{chat_id}:{store_code}:finish"
-            if finish_key in globals().get("FINISHED_KEYS", set()):
-                await q.answer("Финал уже обработан."); return
-            globals().setdefault("FINISHED_KEYS", set()).add(finish_key)
             if store_code:
                 _log_run(store_code, u.id, st)
                 await _notify_viewers_on_finish(context, store_code, u.id, st)
             text = "🎉 Чек-лист завершён!\n\n" + _fmt_progress_text(st)
-            try:
-                await _safe_edit(q, text)
-            finally:
-                _cl_state.pop(chat_id, None)
-            return
+            await _safe_edit(q, text); return
         st["sec"] += 1; si = st["sec"]
-        await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st)); return
+
+    await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Планировщик (JobQueue) — безопасно: только если доступен
@@ -1381,5 +1386,6 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
 
 
