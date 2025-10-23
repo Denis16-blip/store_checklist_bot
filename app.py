@@ -1,4 +1,4 @@
-# app.py — чек-лист + саморегистрация с модерацией + подписки TOM/RD + TZ + (опц.) уведомления + мастер выбора роли
+## app.py — чек-лист + саморегистрация с модерацией + подписки TOM/RD + TZ + (опц.) уведомления + мастер выбора роли
 import os
 import json
 import threading
@@ -9,7 +9,7 @@ from pathlib import Path
 import html
 from zoneinfo import ZoneInfo
 
-from flask import Flask, request, Response
+from flask import Flask, request, Response, jsonify
 from dotenv import load_dotenv
 
 from telegram import (
@@ -23,6 +23,8 @@ from telegram.ext import (
 from telegram.error import BadRequest
 from telegram.warnings import PTBUserWarning
 import httpx
+from psycopg_pool import ConnectionPool  # DB pool (Neon)
+
 
 # 🔇 Спрячем предупреждение PTB про JobQueue, если его нет
 warnings.filterwarnings("ignore", category=PTBUserWarning)
@@ -42,6 +44,23 @@ VIEWER_SECRET  = os.getenv("VIEWER_SECRET", "").strip()
 assert BOT_TOKEN, "BOT_TOKEN is required"
 
 app = Flask(__name__)
+# ──────────────────────────────────────────────────────────────────────────────
+# Database (Neon via psycopg_pool)
+# ──────────────────────────────────────────────────────────────────────────────
+DB_URL = os.getenv("DATABASE_URL", "").strip()
+assert DB_URL, "DATABASE_URL is required"
+
+# Pooled connection for serverless Postgres
+pool = ConnectionPool(conninfo=DB_URL, min_size=1, max_size=5, kwargs={"sslmode": "require"})
+
+def exec_sql(sql: str, params: tuple | None = None, fetch: bool = False):
+    """Helper for simple SQL execution."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            if fetch:
+                return cur.fetchall()
+
 
 _ptb_thread: threading.Thread | None = None
 _loop: asyncio.AbstractEventLoop | None = None
@@ -1365,6 +1384,64 @@ def set_webhook():
         log(f"setWebhook ERROR: {e}")
         return f"error: {e}", 500
 
+
+# ── DB schema & health endpoints ──────────────────────────────────────────────
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS stores (
+  code TEXT PRIMARY KEY,
+  name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+  user_id BIGINT PRIMARY KEY,
+  role TEXT NOT NULL CHECK (role IN ('admin','auditor','viewer')),
+  default_store TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+  user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  store_code TEXT NOT NULL REFERENCES stores(code) ON DELETE CASCADE,
+  PRIMARY KEY (user_id, store_code)
+);
+
+CREATE TABLE IF NOT EXISTS checklist_runs (
+  id BIGSERIAL PRIMARY KEY,
+  store_code TEXT NOT NULL REFERENCES stores(code) ON DELETE CASCADE,
+  auditor_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE SET NULL,
+  status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','finished','cancelled')),
+  started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS checklist_items (
+  run_id BIGINT NOT NULL REFERENCES checklist_runs(id) ON DELETE CASCADE,
+  section INT NOT NULL,
+  item_key TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('✅','❌','⬜️')),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (run_id, section, item_key)
+);
+"""
+
+@app.get("/db-ping")
+def db_ping():
+    try:
+        r = exec_sql("SELECT 1", fetch=True)
+        return {"ok": True, "result": r[0][0] if r else None}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}, 500
+
+@app.get("/db-init")
+def db_init():
+    try:
+        exec_sql(SCHEMA_SQL)
+        exec_sql("INSERT INTO stores(code, name) VALUES "
+                 "('C022','Store_C022'),('C09Z','Store_C09Z') "
+                 "ON CONFLICT DO NOTHING;")
+        return jsonify({"ok": True, "msg": "schema ensured"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 @app.post("/")
 def telegram_webhook():
     if not (_loop_alive and _ptb_ready and _app and _loop):
