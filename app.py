@@ -23,7 +23,7 @@ from telegram.ext import (
 from telegram.error import BadRequest
 from telegram.warnings import PTBUserWarning
 import httpx
-from psycopg_pool import ConnectionPool  # DB pool (Neon)
+import psycopg  # direct Postgres
 
 
 # 🔇 Спрячем предупреждение PTB про JobQueue, если его нет
@@ -51,16 +51,18 @@ DB_URL = os.getenv("DATABASE_URL", "").strip()
 assert DB_URL, "DATABASE_URL is required"
 
 # Pooled connection for serverless Postgres
-pool = ConnectionPool(conninfo=DB_URL, min_size=1, max_size=5, kwargs={"sslmode": "require"})
 
 def exec_sql(sql: str, params: tuple | None = None, fetch: bool = False):
-    """Helper for simple SQL execution."""
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            if fetch:
-                return cur.fetchall()
-
+    """Simple helper for SQL execution (no pool).""" 
+    try:
+        with psycopg.connect(DB_URL, sslmode="require", connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params or ())
+                if fetch:
+                    return cur.fetchall()
+    except Exception as e:
+        print(f"[DB ERROR] {e}", flush=True)
+        raise
 
 _ptb_thread: threading.Thread | None = None
 _loop: asyncio.AbstractEventLoop | None = None
@@ -1463,4 +1465,3 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
-
