@@ -419,16 +419,23 @@ def _fmt_section_text(si: int, st) -> str:
 def _kb_section(si: int, st):
     sec = CHECKLIST[si]
     sec_marks = st["marks"].get(si, {})
-    rows = []
+    rows: list[list[InlineKeyboardButton]] = []
+    # Кнопки пунктов
     for ii in range(len(sec["items"])):
         v = sec_marks.get(ii)
         sym = "✅" if v is True else ("❌" if v is False else "⬜️")
         rows.append([InlineKeyboardButton(f"{ii+1} {sym}", callback_data=f"cl:toggle:{ii}")])
-    rows.append([InlineKeyboardButton("⬅ Назад", callback_data="cl:prev"), InlineKeyboardButton("➡ Далее", callback_data="cl:next")])
-extras = [InlineKeyboardButton("📋 Прогресс", callback_data="cl:progress")]
+    # Навигация по секциям
+    rows.append([
+        InlineKeyboardButton("⬅ Назад", callback_data="cl:prev"),
+        InlineKeyboardButton("➡ Далее", callback_data="cl:next"),
+    ])
+    # Доп. действия
+    extras = [InlineKeyboardButton("📋 Прогресс", callback_data="cl:progress")]
     if si in EXAMPLE_PHOTOS:
         extras.insert(0, InlineKeyboardButton("📷 Пример", callback_data="cl:photo"))
     rows.append(extras)
+    rows.append([InlineKeyboardButton("📑 Перейти к разделу", callback_data="cl:goto")])
     rows.append([InlineKeyboardButton("♻️ Сброс секции", callback_data="cl:resetsec")])
     return InlineKeyboardMarkup(rows)
 
@@ -1379,5 +1386,4 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
-
 
