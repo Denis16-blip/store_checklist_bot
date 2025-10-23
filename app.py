@@ -415,29 +415,6 @@ def _fmt_section_text(si: int, st) -> str:
     lines += ["", f"Прогресс: *{done}/{total}* ({pct}%)", "_Нажимай на номера, чтобы ⬜️→✅→❌._"]
     return "\n".join(lines)
 
-
-def _fmt_progress_text(st) -> str:
-    """Format overall progress across all sections for Markdown."""
-    lines = ["*Прогресс по чек-листу*"]
-    done, total = _human_sec_progress(st)
-    pct = int(round(100 * done / total)) if total else 0
-    lines.append(f"Всего: *{done}/{total}* ({pct}%)")
-    for i, sec in enumerate(CHECKLIST):
-        sec_marks = st["marks"].get(i, {}) or {}
-        d = sum(1 for v in sec_marks.values() if v is True)
-        t = len(sec["items"])
-        if t == 0:
-            sym = "⬜️"
-        elif d == 0:
-            sym = "⬜️"
-        elif d == t:
-            sym = "✅"
-        else:
-            sym = "🟡"
-        lines.append(f"{i+1}. {sym} {sec['title']} — {d}/{t}")
-    lines.append("_Нажимай на номера, чтобы ⬜️→✅→❌._")
-    return "\n".join(lines)
-
 def _kb_section(si: int, st):
     sec = CHECKLIST[si]
     sec_marks = st["marks"].get(si, {})
@@ -454,6 +431,7 @@ def _kb_section(si: int, st):
     if si in EXAMPLE_PHOTOS:
         extras.insert(0, InlineKeyboardButton("📷 Пример", callback_data="cl:photo"))
     rows.append(extras)
+    rows.append([InlineKeyboardButton("📑 Перейти к разделу", callback_data="cl:goto")])
     rows.append([InlineKeyboardButton("♻️ Сброс секции", callback_data="cl:resetsec")])
     return InlineKeyboardMarkup(rows)
 
