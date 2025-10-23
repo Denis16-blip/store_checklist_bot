@@ -868,10 +868,6 @@ async def cmd_setstore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if prof["stores"] and code not in prof["stores"]:
         await update.effective_chat.send_message("Этот магазин тебе не назначен. Обратись к администратору."); return
     prof["current_store"] = code; _upd_from_user(u, prof); _save_staff()
-    try:
-        _cl_state.pop(update.effective_chat.id, None)
-    except Exception:
-        pass
     await update.effective_chat.send_message(f"Ок! Текущий магазин: <b>{html.escape(code)}</b> — {html.escape(STORE_CATALOG[code])}", parse_mode="HTML")
 
 async def cmd_setrole(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1065,25 +1061,13 @@ async def cl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "next":
-        sec = CHECKLIST[si]
-        filled = st["marks"].get(si, {})
-        missing = [i for i in range(len(sec["items"])) if i not in filled]
-        if missing:
-            await q.answer("Отметь все пункты (✅ или ❌) прежде чем продолжить", show_alert=True)
-            return
         if si >= len(CHECKLIST) - 1:
             store_code = prof.get("current_store")
             if store_code:
                 _log_run(store_code, u.id, st)
                 await _notify_viewers_on_finish(context, store_code, u.id, st)
-            text = "🎉 Чек-лист завершён!
-
-" + _fmt_progress_text(st)
-            try:
-                await _safe_edit(q, text)
-            finally:
-                _cl_state.pop(chat_id, None)
-            return
+            text = "🎉 Чек-лист завершён!\n\n" + _fmt_progress_text(st)
+            await _safe_edit(q, text); return
         st["sec"] += 1; si = st["sec"]
 
     await _safe_edit(q, _fmt_section_text(si, st), reply_markup=_kb_section(si, st))
