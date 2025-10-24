@@ -1,4 +1,4 @@
-# app.py — чек-лист + саморегистрация с модерацией + подписки TOM/RD + TZ + (опц.) уведомления + мастер выбора роли
+## app.py — чек-лист + саморегистрация с модерацией + подписки TOM/RD + TZ + (опц.) уведомления + мастер выбора роли
 import os
 import json
 import threading
@@ -23,7 +23,7 @@ from telegram.ext import (
 from telegram.error import BadRequest
 from telegram.warnings import PTBUserWarning
 import httpx
-import psycopg  # direct Postgres
+from psycopg_pool import ConnectionPool  # DB pool (Neon)
 
 
 # 🔇 Спрячем предупреждение PTB про JobQueue, если его нет
@@ -51,121 +51,16 @@ DB_URL = os.getenv("DATABASE_URL", "").strip()
 assert DB_URL, "DATABASE_URL is required"
 
 # Pooled connection for serverless Postgres
+pool = ConnectionPool(conninfo=DB_URL, min_size=1, max_size=5, kwargs={"sslmode": "require"})
 
 def exec_sql(sql: str, params: tuple | None = None, fetch: bool = False):
-    """Simple helper for SQL execution (no pool).""" 
-    try:
-        with psycopg.connect(DB_URL, sslmode="require", connect_timeout=5) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                if fetch:
-                    return cur.fetchall()
-    except Exception as e:
-        print(f"[DB ERROR] {e}", flush=True)
-        raise
+    """Helper for simple SQL execution."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            if fetch:
+                return cur.fetchall()
 
-# ── Mini-DAO for metadata storage ─────────────────────────────────────────────
-def upsert_user(user_id: int, role: str, default_store: str | None = None):
-    exec_sql(
-        """
-        INSERT INTO users(user_id, role, default_store)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (user_id) DO UPDATE
-        SET role = EXCLUDED.role,
-            default_store = COALESCE(EXCLUDED.default_store, users.default_store)
-        """,
-        (user_id, role, default_store),
-    )
-
-def get_user(user_id: int):
-    rows = exec_sql("SELECT user_id, role, default_store, created_at FROM users WHERE user_id=%s", (user_id,), fetch=True)
-    return rows[0] if rows else None
-
-def add_subscription(user_id: int, store_code: str):
-    exec_sql(
-        "INSERT INTO subscriptions(user_id, store_code) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-        (user_id, store_code),
-    )
-
-def remove_subscription(user_id: int, store_code: str):
-    exec_sql("DELETE FROM subscriptions WHERE user_id=%s AND store_code=%s", (user_id, store_code))
-
-def list_subscriptions(user_id: int):
-    return exec_sql(
-        "SELECT s.store_code, st.name FROM subscriptions s JOIN stores st ON st.code=s.store_code WHERE s.user_id=%s ORDER BY s.store_code",
-        (user_id,), fetch=True
-    )
-
-def start_run(store_code: str, auditor_id: int, ydisk_folder: str) -> int:
-    rows = exec_sql(
-        """
-        INSERT INTO runs(store_code, auditor_id, ydisk_folder)
-        VALUES (%s, %s, %s)
-        RETURNING id
-        """,
-        (store_code, auditor_id, ydisk_folder),
-        fetch=True,
-    )
-    return int(rows[0][0])
-
-def finish_run(run_id: int, items_total: int, items_ok: int, items_fail: int, ydisk_summary_file: str | None):
-
-
-# ── Debug commands for DB testing (temporary) ─────────────────────────────────
-async def cmd_dbg_start_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if len(context.args) < 1:
-            await update.message.reply_text("Используй: /dbg_start_run <КОД_МАГАЗИНА>")
-            return
-        store_code = context.args[0].strip().upper()
-        folder = f"/checklists/{store_code}/{datetime.utcnow().date().isoformat()}/dbg/"
-        run_id = start_run(store_code, update.effective_user.id, folder)
-        await update.message.reply_text(f"✅ Тестовый запуск создан, id={run_id}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-
-async def cmd_dbg_finish_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if len(context.args) < 4:
-            await update.message.reply_text("Используй: /dbg_finish_run <id> <total> <ok> <fail>")
-            return
-        run_id = int(context.args[0])
-        total = int(context.args[1]); ok = int(context.args[2]); fail = int(context.args[3])
-        summary = f"/checklists/summary/{run_id}.json"
-        finish_run(run_id, total, ok, fail, summary)
-        await update.message.reply_text(f"🏁 Тестовая запись #{run_id} завершена")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-    exec_sql(
-        """
-        UPDATE runs
-           SET status='finished',
-               finished_at=now(),
-               items_total=%s, items_ok=%s, items_fail=%s,
-               ydisk_summary_file=%s
-         WHERE id=%s
-        """,
-        (items_total, items_ok, items_fail, ydisk_summary_file, run_id),
-    )
-
-def cancel_run(run_id: int):
-    exec_sql(
-        "UPDATE runs SET status='cancelled', finished_at=now() WHERE id=%s",
-        (run_id,),
-    )
-
-def last_runs_by_store(store_code: str, limit: int = 20):
-    return exec_sql(
-        """
-        SELECT id, auditor_id, status, started_at, finished_at, items_total, items_ok, items_fail, ydisk_folder, ydisk_summary_file
-          FROM runs
-         WHERE store_code=%s
-         ORDER BY started_at DESC
-         LIMIT %s
-        """,
-        (store_code, limit),
-        fetch=True,
-    )
 
 _ptb_thread: threading.Thread | None = None
 _loop: asyncio.AbstractEventLoop | None = None
@@ -1352,12 +1247,61 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data.startswith("tom:"):
         await tom_callbacks(update, context); return
 
+
+# ── DBG: тестовые команды для проверки записи в БД ────────────────────────────
+async def cmd_dbg_start_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создаёт тестовый run в таблице runs."""
+    msg = update.effective_message
+    user = update.effective_user
+    args = context.args or []
+
+    if not msg:
+        return
+    if len(args) < 1:
+        await msg.reply_text("Используй: /dbg_start_run <КОД_МАГАЗИНА>")
+        return
+
+    store_code = args[0].strip().upper()
+    # Заглушка папки на Я.Диске — позже заменим на реальную интеграцию
+    folder = f"/checklists/{store_code}/{datetime.now(timezone.utc).strftime('%Y-%m-%d')}/{int(datetime.now().timestamp())}/"
+
+    try:
+        run_id = start_run(store_code, user.id, folder)
+        await msg.reply_text(f"✅ Тестовый запуск создан, id={run_id}")
+    except Exception as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+
+async def cmd_dbg_finish_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Завершает тестовый run и записывает агрегаты."""
+    msg = update.effective_message
+    args = context.args or []
+
+    if not msg:
+        return
+    if len(args) < 4:
+        await msg.reply_text("Используй: /dbg_finish_run <id> <total> <ok> <fail>")
+        return
+
+    try:
+        run_id = int(args[0])
+        total = int(args[1])
+        ok = int(args[2])
+        fail = int(args[3])
+    except ValueError:
+        await msg.reply_text("id/total/ok/fail должны быть числами")
+        return
+
+    try:
+        yfile = f"/checklists/summary_{run_id}.json"  # заглушка
+        finish_run(run_id, total, ok, fail, yfile)
+        await msg.reply_text(f"🏁 Тестовая запись #{run_id} завершена")
+    except Exception as e:
+        await msg.reply_text(f"❌ Ошибка: {e}")
+
 def build_application() -> Application:
     app_ = Application.builder().token(BOT_TOKEN).build()
     # команды
     app_.add_handler(CommandHandler("start", cmd_start))
-    app_.add_handler(CommandHandler("dbg_start_run", cmd_dbg_start_run))
-    app_.add_handler(CommandHandler("dbg_finish_run", cmd_dbg_finish_run))
     app_.add_handler(CommandHandler("register", cmd_register))
     app_.add_handler(CommandHandler("pending", cmd_pending))
     app_.add_handler(CommandHandler("checklist", cmd_checklist))
@@ -1493,7 +1437,8 @@ def set_webhook():
 
 
 # ── DB schema & health endpoints ──────────────────────────────────────────────
-SCHEMA_SQL = """CREATE TABLE IF NOT EXISTS stores (
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS stores (
   code TEXT PRIMARY KEY,
   name TEXT NOT NULL
 );
@@ -1511,23 +1456,23 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   PRIMARY KEY (user_id, store_code)
 );
 
--- Метаданные запуска чек-листа (детали и фото храним на Я.Диске)
-CREATE TABLE IF NOT EXISTS runs (
+CREATE TABLE IF NOT EXISTS checklist_runs (
   id BIGSERIAL PRIMARY KEY,
-  store_code TEXT NOT NULL REFERENCES stores(code) ON DELETE RESTRICT,
-  auditor_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE RESTRICT,
+  store_code TEXT NOT NULL REFERENCES stores(code) ON DELETE CASCADE,
+  auditor_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE SET NULL,
   status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','finished','cancelled')),
   started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  finished_at TIMESTAMPTZ,
-  ydisk_folder TEXT NOT NULL,
-  ydisk_summary_file TEXT,
-  items_total INT,
-  items_ok INT,
-  items_fail INT
+  finished_at TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_runs_store_started_at ON runs(store_code, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_runs_auditor_started_at ON runs(auditor_id, started_at DESC);
+CREATE TABLE IF NOT EXISTS checklist_items (
+  run_id BIGINT NOT NULL REFERENCES checklist_runs(id) ON DELETE CASCADE,
+  section INT NOT NULL,
+  item_key TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('✅','❌','⬜️')),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (run_id, section, item_key)
+);
 """
 
 @app.get("/db-ping")
@@ -1543,14 +1488,12 @@ def db_init():
     try:
         exec_sql(SCHEMA_SQL)
         exec_sql("INSERT INTO stores(code, name) VALUES "
-                 "('C022','RU_MOSCOW_OkhotnyRyad_URBAN'),('C09Z','RU_KALUGA_RIO_SPORT') "
+                 "('C022','Store_C022'),('C09Z','Store_C09Z') "
                  "ON CONFLICT DO NOTHING;")
         return jsonify({"ok": True, "msg": "schema ensured"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-
 @app.post("/")
-
 def telegram_webhook():
     if not (_loop_alive and _ptb_ready and _app and _loop):
         log("webhook → loop not ready (503)"); return Response("loop not ready", status=503)
@@ -1571,3 +1514,7 @@ def _before_any():
 if __name__ == "__main__":
     ensure_ptb_started()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+
+
+# register dbg handlers
+# (fallback)
